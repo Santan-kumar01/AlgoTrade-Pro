@@ -6,7 +6,8 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from src.core.config import settings
-from src.models.base import Base
+from src.models import Base
+import src.models  # Register all ORM models with Base.metadata
 
 
 config = context.config
