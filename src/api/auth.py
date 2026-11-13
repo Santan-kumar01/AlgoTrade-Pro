@@ -3,10 +3,17 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.deps import get_current_user
 from src.core.database import get_db
-from src.core.security import hash_password
+from src.core.jwt import create_access_token
+from src.core.security import hash_password, verify_password
 from src.models import User
-from src.schemas.auth import UserRegister, UserResponse
+from src.schemas.auth import (
+    TokenResponse,
+    UserLogin,
+    UserRegister,
+    UserResponse,
+)
 
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -53,3 +60,46 @@ async def register_user(
         ) from None
 
     return UserResponse.model_validate(user)
+
+
+@router.post(
+    "/login",
+    response_model=TokenResponse,
+)
+async def login_user(
+    credentials: UserLogin,
+    db: AsyncSession = Depends(get_db),
+) -> TokenResponse:
+    """Authenticate a user and return a JWT access token."""
+
+    normalized_email = str(credentials.email).lower()
+
+    user = await db.scalar(
+        select(User).where(User.email == normalized_email)
+    )
+
+    if user is None or not verify_password(
+        credentials.password,
+        user.password_hash,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    access_token = create_access_token(user.id)
+
+    return TokenResponse(access_token=access_token)
+
+
+@router.get(
+    "/me",
+    response_model=UserResponse,
+)
+async def read_current_user(
+    current_user: User = Depends(get_current_user),
+) -> UserResponse:
+    """Return the currently authenticated user's profile."""
+
+    return UserResponse.model_validate(current_user)
