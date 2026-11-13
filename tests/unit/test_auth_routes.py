@@ -6,6 +6,8 @@ from httpx import ASGITransport, AsyncClient
 
 from src.main import app
 from src.core.database import get_db
+from src.api.deps import get_current_user
+from src.models import User
 
 
 @pytest.mark.asyncio
@@ -84,3 +86,101 @@ async def test_register_endpoint_rejects_short_password():
         )
 
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_login_endpoint_returns_access_token():
+    user = User(
+        id=uuid4(),
+        email="login@example.com",
+        password_hash="argon2-hash",
+    )
+
+    mock_db = MagicMock()
+    mock_db.scalar = AsyncMock(return_value=user)
+
+    async def override_get_db():
+        yield mock_db
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        with patch("src.api.auth.verify_password", return_value=True), patch(
+            "src.api.auth.create_access_token",
+            return_value="test-access-token",
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                response = await client.post(
+                    "/api/v1/auth/login",
+                    json={
+                        "email": "login@example.com",
+                        "password": "StrongPass@2026",
+                    },
+                )
+
+        assert response.status_code == 200
+        assert response.json()["access_token"] == "test-access-token"
+        assert response.json()["token_type"] == "bearer"
+
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_me_endpoint_returns_authenticated_user():
+    user = User(
+        id=uuid4(),
+        email="profile@example.com",
+        password_hash="argon2-hash",
+    )
+
+    async def override_current_user():
+        return user
+
+    app.dependency_overrides[get_current_user] = override_current_user
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                "/api/v1/auth/me",
+                headers={"Authorization": "Bearer valid-test-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["id"] == str(user.id)
+        assert response.json()["email"] == "profile@example.com"
+        assert "password_hash" not in response.json()
+
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_me_endpoint_rejects_missing_token():
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/api/v1/auth/me")
+
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_me_endpoint_rejects_invalid_token():
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": "Bearer invalid-token"},
+        )
+
+    assert response.status_code == 401
