@@ -4,7 +4,7 @@
 **Feature Branch:** `feature/trading-engine`
 **Base Branch:** `main`
 **Author:** Team Lead – Trading Engine
-**Status:** Approved Architecture Baseline (Phase 1 – Day 2 Tasks 1 & 2)
+**Status:** Approved Architecture Baseline
 
 ---
 
@@ -453,8 +453,17 @@ If `result.scalar_one_or_none()` evaluates to `None`:
 
 ### 7.2 Transaction Atomicity & Service Boundary
 
-#### 7.2.1 Service-Owned Transaction Boundary (`async with session.begin():`)
+#### 7.2.1 Service-Owned Transaction Boundary & SQLAlchemy Autobegin Protection
 The Service layer strictly owns the lifecycle of the database transaction. Every trade operation executes within a single async context manager:
+
+##### Understanding SQLAlchemy 2.0 Autobegin
+SQLAlchemy 2.0 `AsyncSession` uses an **autobegin** model by default. When any query (such as a read or execute) is executed on an idle session without an explicit `session.begin()`, SQLAlchemy automatically initiates an implicit transaction.
+- **Risk:** If an earlier middleware, pre-execution hook, or dependency executes a database query on the session *before* reaching the service layer's `async with session.begin():`, SQLAlchemy raises:
+  `sqlalchemy.exc.InvalidRequestError: A transaction is already begun on this Session.`
+- **Architectural Safeguards:**
+  1. **Clean Dependency Hand-Off:** FastAPI's `get_db()` yields a pristine session that has not executed any statements. No middleware or authentication dependency may execute queries on the trading session prior to `TradingService`.
+  2. **Service Entry Point:** The service layer enters `async with session.begin():` as the **very first operation** touching the database on that session.
+  3. **Idempotent Boundary Pattern:** Where ambient transactions may exist (e.g., in integration tests), the service checks `if not session.in_transaction():` or utilizes `session.begin_nested()` to create a savepoint rather than attempting a duplicate top-level begin.
 
 ```python
 # Conceptual Service Layer Transaction Boundary (src/services/trading_service.py)
@@ -467,7 +476,7 @@ class TradingService:
         price: Decimal,
         session: AsyncSession,
     ) -> OrderResponse:
-        # Atomic Transaction Boundary begins here:
+        # Atomic Transaction Boundary begins here before any query executes:
         async with session.begin():
             # 1. Acquire pessimistic lock on wallet
             wallet = await self.wallet_repo.get_wallet_for_update(wallet_id, session)
@@ -559,14 +568,19 @@ The following database modifications **must succeed or fail as a single atomic u
   - If Trade 2 locks first: Trade 2 sees balance $10.00 < $200, fails with `InsufficientFundsError`, rolls back. Trade 1 acquires lock next, executes sell, balance becomes $510.00.
   - **Result:** In both interleavings, state transitions are strictly linear, mathematically consistent, and deterministic.
 
-#### 7.3.4 What Happens When a Wallet is Locked (LockWait & Timeouts)
+#### 7.3.4 What Happens When a Wallet is Locked (LockWait & Driver/SQLSTATE Timeouts)
 - When a connection requests `FOR UPDATE` on a locked row, PostgreSQL pauses query execution on that socket and registers the connection in its internal lock wait graph.
 - The waiting connection consumes negligible CPU while waiting on the socket.
 - To prevent indefinite hangs in the event of an orphaned client connection or degraded external network, the application will configure a PostgreSQL statement-level lock timeout:
   ```sql
   SET LOCAL lock_timeout = '5s';
   ```
-  If a lock cannot be acquired within 5 seconds, PostgreSQL raises a `LockNotAvailable` exception, causing an immediate clean rollback and an HTTP `503 Service Unavailable` or `409 Conflict` response to the client.
+  If a lock cannot be acquired within 5 seconds, PostgreSQL aborts the query with SQLSTATE code `55P03` (`lock_not_available`).
+- **Driver and SQLSTATE Classification:**
+  Depending on the async driver and SQLAlchemy version:
+  - AsyncPG may raise `asyncpg.exceptions.LockNotAvailableError` or wrap it within `QueryCanceledError` / `PostgresError` with `sqlstate='55P03'`.
+  - SQLAlchemy catches and wraps this driver exception inside `sqlalchemy.exc.OperationalError` or `sqlalchemy.exc.DBAPIError`.
+  - **Classification Protocol:** The exception handling layer must inspect `getattr(exc.orig, 'pgcode', None) == '55P03'` (or driver SQLSTATE attributes) rather than relying on a single Python exception class. This reliably triggers an immediate clean rollback and an HTTP `503 Service Unavailable` response with `LOCK_TIMEOUT`.
 
 #### 7.3.5 Revalidation Invariant: Why Balance and Holdings Must Be Evaluated INSIDE the Lock
 - **Critical Architectural Invariant:** Reading wallet balance or calculating holdings *before* acquiring the row lock is a severe defect.
@@ -583,70 +597,530 @@ The following database modifications **must succeed or fail as a single atomic u
 
 ---
 
-### 7.4 Rollback & Failure Handling
+## 8. Complete Trading Engine Error-Handling Matrix & Protocol
 
-#### 7.4.1 Comprehensive Failure Mode Matrix
+This section formalizes the error-handling matrix, domain exception hierarchy, layer responsibilities, rollback behaviors, and client error response structures across all trading execution paths.
 
-| Failure Mode | Trigger Point | Rollback Mechanism | API Response |
-|---|---|---|---|
-| **Insufficient Balance** | Service checks `wallet.balance < total_cost` during Buy | Service raises `InsufficientFundsError`. `session.begin()` catches exception and triggers `ROLLBACK`. Lock released. | `HTTP 400 Bad Request`<br/>`{"error": "INSUFFICIENT_FUNDS", "detail": "..."}` |
-| **Insufficient Holdings** | Service checks `available_holdings < quantity` during Sell | Service raises `InsufficientHoldingsError`. `session.begin()` catches exception and triggers `ROLLBACK`. Lock released. | `HTTP 400 Bad Request`<br/>`{"error": "INSUFFICIENT_HOLDINGS", "detail": "..."}` |
-| **Asset Not Found / Inactive** | Service checks `asset is None` or `asset.is_active is False` | Service raises `AssetNotFoundError` or `AssetInactiveError`. Transaction rolls back immediately. Lock released. | `HTTP 404 Not Found` or `HTTP 400 Bad Request`<br/>`{"error": "ASSET_INACTIVE", "detail": "..."}` |
-| **Missing Wallet** | `get_wallet_for_update` returns `None` | Service raises `WalletNotFoundError`. Transaction rolls back immediately. | `HTTP 404 Not Found`<br/>`{"error": "WALLET_NOT_FOUND", "detail": "..."}` |
-| **Check Constraint Violation** | E.g. `ck_transactions_total_amount_matches_quantity_price` violated | SQLAlchemy catches `IntegrityError` from PostgreSQL. Transaction rolls back. Balance mutation is discarded. | `HTTP 422 Unprocessable Entity` or `HTTP 500 Internal Server Error` |
-| **Lock Timeout (`LockNotAvailable`)** | Wallet lock held by another process exceeds 5s | PostgreSQL aborts query. Transaction context rolls back. | `HTTP 503 Service Unavailable`<br/>`{"error": "LOCK_TIMEOUT", "detail": "Trading engine busy, please retry"}` |
-| **Connection / Commit Failure** | Database disconnect during `commit` | Socket drops; PostgreSQL aborts transaction and releases locks. Application catches `OperationalError`. | `HTTP 503 Service Unavailable`<br/>`{"error": "DATABASE_ERROR", "detail": "Transaction could not be completed"}` |
+### 8.1 The 12 Core Trading Engine Error Scenarios
 
-#### 7.4.2 Prevention of Partial Updates
-Because PostgreSQL transactions are strictly atomic:
-- If an exception occurs after updating `wallet.balance` in memory or in the session, but before `commit()` completes, **PostgreSQL discards the pending write buffer**.
-- The `wallets` row in the database remains completely unchanged.
-- No partial ledger records are ever written.
-- The row lock is immediately surrendered, allowing subsequent requests to proceed safely.
-
-#### 7.4.3 Error Propagation Architecture
-1. **Domain Exceptions in Service Layer:** Clean custom Python exception classes inheriting from a base `TradingEngineException` (e.g., `InsufficientFundsError`, `InsufficientHoldingsError`, `AssetInactiveError`, `WalletNotFoundError`).
-2. **Exception Handlers in API Layer:** FastAPI `@app.exception_handler` decorators or router-level try/except blocks intercept domain exceptions and map them to standard HTTP status codes with structured, user-friendly JSON payloads.
-3. **No Leaked Stack Traces:** Internal database exception details (such as raw PostgreSQL SQL statements or driver tracebacks) are logged securely in backend logs for developer debugging, while sanitized domain messages are returned to the client.
+| # | Error Scenario | Responsible Layer | Triggering Condition | Proposed Domain / System Exception | HTTP Status Code | Machine-Readable Error Code | Client-Facing Safe Error Message | Transaction Rollback? |
+|:---:|---|---|---|---|:---:|---|---|:---:|
+| **1** | **Insufficient Wallet Balance** | **Service Layer** | `wallet.balance < (quantity * price)` during Buy execution | `InsufficientFundsError` | `400 Bad Request` | `INSUFFICIENT_FUNDS` | `"Insufficient wallet balance to execute this buy order."` | **Yes** (Automatic via `session.begin()`) |
+| **2** | **Inactive Asset** | **Service Layer** | `asset.is_active is False` | `AssetInactiveError` | `400 Bad Request` | `ASSET_INACTIVE` | `"The requested asset is currently inactive and cannot be traded."` | **Yes** (Automatic via `session.begin()`) |
+| **3** | **Asset Not Found** | **Service Layer** | Query for `asset_id` returns `None` | `AssetNotFoundError` | `404 Not Found` | `ASSET_NOT_FOUND` | `"The specified tradable asset does not exist."` | **Yes** (Automatic via `session.begin()`) |
+| **4** | **Invalid or Non-Positive Quantity** | **Schema Layer** | `quantity <= 0`, `NaN`, scale > 8, or unparseable | `pydantic.ValidationError` | `422 Unprocessable Entity` | `INVALID_QUANTITY` | `"Quantity must be a positive decimal number with at most 8 decimal places."` | **No** (Pre-transaction, rejected before DB access) |
+| **5** | **Invalid or Non-Positive Price** | **Schema Layer** | `price <= 0`, `NaN`, scale > 8, or unparseable | `pydantic.ValidationError` | `422 Unprocessable Entity` | `INVALID_PRICE` | `"Price must be a positive decimal number with at most 8 decimal places."` | **No** (Pre-transaction, rejected before DB access) |
+| **6** | **Wallet Not Found** | **Service Layer** | Query for `wallet_id` with `FOR UPDATE` returns `None` | `WalletNotFoundError` | `404 Not Found` | `WALLET_NOT_FOUND` | `"User trading wallet not found."` | **Yes** (Automatic via `session.begin()`) |
+| **7** | **Insufficient Holdings During Sell** | **Service Layer** | `available_holdings < quantity` | `InsufficientHoldingsError` | `400 Bad Request` | `INSUFFICIENT_HOLDINGS` | `"Insufficient asset holdings to execute this sell order."` | **Yes** (Automatic via `session.begin()`) |
+| **8** | **Database Constraint Violation** | **Database Layer** | Check, foreign key, or unique constraint violated in PostgreSQL | `sqlalchemy.exc.IntegrityError` | Classified by SQLSTATE / Constraint: `400` (balance check), `404` (FK missing), `409` (unique), `422` (math check) | `INTEGRITY_VIOLATION` / `INSUFFICIENT_FUNDS` | Dynamic safe message based on constraint classification | **Yes** (PostgreSQL immediately aborts transaction) |
+| **9** | **Database Connection Failure** | **Database Layer** | PostgreSQL unreachable, socket reset, network failure | `sqlalchemy.exc.OperationalError` / `asyncpg.exceptions.PostgresConnectionError` | `503 Service Unavailable` | `DATABASE_CONNECTION_ERROR` | `"Database service temporarily unavailable. Please retry later."` | **Yes** (Socket dropped, PostgreSQL server-aborted) |
+| **10** | **Commit / Disconnection Failure** | **Service / Database Layer** | Socket drops or network partition precisely during `COMMIT` phase | `sqlalchemy.exc.OperationalError` / `sqlalchemy.exc.DBAPIError` | `503 Service Unavailable` / `500` | `TRANSACTION_OUTCOME_UNCERTAIN` | `"Network interruption occurred during trade confirmation. Please inspect your order history before retrying."` | **Indeterminate** (Server may have committed before drop; requires status verification, not blind rollback assumption) |
+| **11** | **Row-Lock Timeout** | **Database Layer** | Waiting for `FOR UPDATE` lock on `Wallet` exceeds `5s` (`SQLSTATE 55P03`) | `asyncpg.exceptions.PostgresError` (`55P03`) / `sqlalchemy.exc.OperationalError` | `503 Service Unavailable` | `LOCK_TIMEOUT` | `"Trading engine is busy processing other transactions on this wallet. Please retry."` | **Yes** (PostgreSQL query timeout aborts transaction) |
+| **12** | **Unauthorized Request** | **API Layer** | Missing, expired, malformed, or invalid JWT Bearer token | `fastapi.HTTPException(status_code=401)` | `401 Unauthorized` | `UNAUTHORIZED` | `"Authentication credentials were not provided or are invalid."` | **No** (Rejected at dependency injection before DB access) |
 
 ---
 
-## 8. Key Architectural Decisions & Invariants
+### 8.2 Error-Handling Responsibilities Across Architecture Tiers
 
-### 8.1 Single Source of Truth for Asset Holdings
+```
+[ Incoming HTTP Request ]
+          │
+          ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 1. API Security / Dependency Layer                                     │
+│    - Scenario 12: Validate JWT Bearer token                            │
+│    - Fails ➔ 401 Unauthorized (No DB connection opened)                │
+└─────────────────────────────────┬──────────────────────────────────────┘
+                                  │ Valid JWT Context
+                                  ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 2. Schema Validation Layer (Pydantic v2)                               │
+│    - Scenarios 4 & 5: Check quantity > 0, price > 0, Decimal scale <= 8│
+│    - Fails ➔ 422 Unprocessable Entity (Zero DB interaction)            │
+└─────────────────────────────────┬──────────────────────────────────────┘
+                                  │ Syntactically Valid Payload
+                                  ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 3. Service Layer Business Logic (async with session.begin():)          │
+│    - Scenario 6: Verify wallet exists (WalletNotFoundError ➔ 404)       │
+│    - Scenario 3: Verify asset exists (AssetNotFoundError ➔ 404)        │
+│    - Scenario 2: Verify asset active (AssetInactiveError ➔ 400)        │
+│    - Scenario 1: Verify balance >= cost (InsufficientFundsError ➔ 400) │
+│    - Scenario 7: Verify holdings >= qty (InsufficientHoldingsError ➔ 400│
+│    - Fails ➔ Raises domain exception ➔ Automatic Transaction Rollback  │
+└─────────────────────────────────┬──────────────────────────────────────┘
+                                  │ Business Rules Validated
+                                  ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 4. Database Physical Execution (PostgreSQL / AsyncPG)                  │
+│    - Scenario 11: Lock timeout exceeded (QueryCanceledError ➔ 503)     │
+│    - Scenario 8: Constraint violation (IntegrityError ➔ 422/400)       │
+│    - Scenario 9: Connection dropped (OperationalError ➔ 503)           │
+│    - Scenario 10: Commit failed (DBAPIError ➔ 500)                     │
+│    - Fails ➔ PostgreSQL aborts ➔ Clean Engine Rollback                │
+└─────────────────────────────────┬──────────────────────────────────────┘
+                                  │
+                                  ▼
+                       [ Order Execution Succeeded ]
+```
+
+#### 8.2.1 Pydantic Validation vs. Business Validation
+A fundamental architectural distinction is maintained between **syntactic/structural validation** and **semantic/business validation**:
+1. **Pydantic Validation (Fast-Path Rejection):**
+   - Executed automatically by FastAPI during request body parsing *before* any database connection is acquired or any lock is requested.
+   - Verifies input types, field presence, positive numerical bounds (`gt=0`), and mathematical limits (e.g. scale $\le 8$).
+   - Returns HTTP `422 Unprocessable Entity` immediately. Zero database resources or worker threads are tied up.
+2. **Business Validation (State-Dependent Evaluation):**
+   - Executed within the Service Layer *after* establishing the atomic transaction context and acquiring the row-level lock on the `Wallet`.
+   - Evaluates dynamic database state: Does the user have enough money? Does the user own enough shares? Is the asset currently open for trading?
+   - Returns HTTP `400 Bad Request` or `404 Not Found`.
+
+#### 8.2.2 Service-Layer Domain Exceptions
+The Trading Engine defines clean, typed domain exceptions that convey explicit business semantics rather than generic HTTP or database errors:
+
+```python
+# Illustrative Domain Exception Hierarchy (src/core/exceptions.py or src/services/exceptions.py)
+class TradingEngineException(Exception):
+    """Base exception for all trading engine business rule violations."""
+    def __init__(self, message: str, error_code: str):
+        super().__init__(message)
+        self.message = message
+        self.error_code = error_code
+
+class InsufficientFundsError(TradingEngineException):
+    def __init__(self, available: Decimal, required: Decimal):
+        super().__init__(
+            message="Insufficient wallet balance to execute this buy order.",
+            error_code="INSUFFICIENT_FUNDS",
+        )
+        self.available = available
+        self.required = required
+
+class InsufficientHoldingsError(TradingEngineException):
+    def __init__(self, available: Decimal, requested: Decimal):
+        super().__init__(
+            message="Insufficient asset holdings to execute this sell order.",
+            error_code="INSUFFICIENT_HOLDINGS",
+        )
+        self.available = available
+        self.requested = requested
+
+class AssetInactiveError(TradingEngineException):
+    def __init__(self, symbol: str):
+        super().__init__(
+            message=f"Asset {symbol} is inactive and cannot be traded.",
+            error_code="ASSET_INACTIVE",
+        )
+        self.symbol = symbol
+
+class AssetNotFoundError(TradingEngineException):
+    def __init__(self, asset_id: uuid.UUID):
+        super().__init__(
+            message="The specified tradable asset does not exist.",
+            error_code="ASSET_NOT_FOUND",
+        )
+        self.asset_id = asset_id
+
+class WalletNotFoundError(TradingEngineException):
+    def __init__(self, wallet_id: uuid.UUID):
+        super().__init__(
+            message="User trading wallet not found.",
+            error_code="WALLET_NOT_FOUND",
+        )
+        self.wallet_id = wallet_id
+```
+
+#### 8.2.3 API-Layer Exception Translation
+- **Zero Leakage:** The Service layer raises domain exceptions without knowing or caring about HTTP status codes.
+- **FastAPI Exception Handlers:** The API layer provides centralized exception handlers (via `@app.exception_handler`) that catch `TradingEngineException` instances and translate them into a standardized JSON envelope:
+  ```json
+  {
+    "error_code": "INSUFFICIENT_FUNDS",
+    "message": "Insufficient wallet balance to execute this buy order.",
+    "details": {
+      "available": "50.00000000",
+      "required": "150.25000000"
+    }
+  }
+  ```
+
+#### 8.2.4 Database Exception Shielding & IntegrityError Classification Protocol
+- **Security Invariant (CWE-209 Prevention):** Raw database exceptions (e.g. `sqlalchemy.exc.IntegrityError`, `asyncpg.exceptions.CheckViolationError`, or `OperationalError`) must **never** be leaked directly into client HTTP responses. Exposing PostgreSQL table names (`wallets`, `transactions`), constraint names (`ck_wallets_balance_non_negative`), internal column names, or driver socket addresses gives malicious actors reconnaissance intelligence.
+- **IntegrityError Classification Protocol:**
+  Rather than applying a blanket HTTP `400` or `422` status code to all `IntegrityError` occurrences, the API exception translation layer must inspect the underlying database error code (`exc.orig.pgcode`) and constraint name:
+  1. **SQLSTATE `23514` (`check_violation`):**
+     - If constraint is `ck_wallets_balance_non_negative`: The balance was exhausted during concurrent execution ➔ Maps to `INSUFFICIENT_FUNDS` (HTTP `400 Bad Request`).
+     - If constraint is `ck_transactions_total_amount_matches_quantity_price` or positive value checks: Mathematical inconsistency or corrupted payload ➔ Maps to `INTEGRITY_VIOLATION` (HTTP `422 Unprocessable Entity`).
+  2. **SQLSTATE `23503` (`foreign_key_violation`):**
+     - If foreign key refers to `wallets.id`: Target wallet does not exist ➔ Maps to `WALLET_NOT_FOUND` (HTTP `404 Not Found`).
+     - If foreign key refers to `assets.id`: Target asset does not exist ➔ Maps to `ASSET_NOT_FOUND` (HTTP `404 Not Found`).
+  3. **SQLSTATE `23505` (`unique_violation`):**
+     - Resource already exists (e.g., duplicate user wallet or asset symbol collision) ➔ Maps to `CONFLICT` (HTTP `409 Conflict`).
+  4. **Unclassified or Internal Integrity Failures:**
+     - Logged in full server-side with structured request metadata.
+     - Returned to client as a sanitized HTTP `422 Unprocessable Entity` or `500 Internal Server Error` with stable code `INTEGRITY_VIOLATION`.
+
+#### 8.2.5 How Rollback is Guaranteed in `async with session.begin():`
+SQLAlchemy's `async with session.begin():` context manager utilizes Python's asynchronous context protocol:
+1. Upon entry (`__aenter__`), it issues a `BEGIN` statement against the database connection.
+2. If an exception exits the block unhandled (whether a domain exception like `InsufficientFundsError`, a database error like `IntegrityError`, or a system cancellation like `asyncio.CancelledError`), the context manager executes its `__aexit__` handler.
+3. The `__aexit__` handler unconditionally calls `await session.rollback()`.
+4. PostgreSQL discards all uncommitted modifications (wallet balance adjustments, ledger insertions) and **releases all held row-level locks** on `wallets`.
+5. The session safely reverts to a clean state before propagating the exception up to the API exception handler.
+
+#### 8.2.6 Indeterminate Commit Outcomes (Disconnection During Commit)
+If a network partition, socket disconnection, or worker crash occurs precisely while transmitting `COMMIT` or while awaiting PostgreSQL's acknowledgment:
+- **The Core Dilemma:** The client/application cannot know with certainty whether PostgreSQL processed the commit prior to the disconnection or whether it aborted the transaction.
+- **Handling Protocol:**
+  1. The application layer must **NOT** assume an automatic rollback occurred.
+  2. The application must **NOT** blindly re-execute the trade (which could produce an accidental double-trade).
+  3. The error handler returns HTTP `503 Service Unavailable` or `500 Internal Server Error` with machine-readable code `TRANSACTION_OUTCOME_UNCERTAIN` and safe message:
+     `"A network interruption occurred during trade confirmation. Please inspect your order history before retrying."`
+  4. A high-priority operational log is emitted recording `wallet_id`, `asset_id`, and transaction timestamp for automated or manual ledger reconciliation.
+
+---
+
+## 9. Repository Contracts & Async Session Management Architecture
+
+This section formalizes the repository interface specifications, method contracts, dependency-injected session lifecycle, and testing strategy for the Trading Engine.
+
+> **Design Notice:** The repository and service contracts documented in this section represent the **proposed architectural design** for trading operations. They strictly adhere to SQLAlchemy 2.0 async patterns and project conventions.
+
+### 9.1 TradingRepository Contracts & Method Specifications
+
+The `TradingRepository` encapsulates all direct database interactions, query construction, and locking primitives. It receives an active `AsyncSession` upon instantiation or method invocation and does not manage its own transaction boundaries.
+
+| Method Signature | Purpose | Parameters & Types | Return Type | Async? | Acquires Row Lock? | Modifies DB State? |
+|---|---|---|---|:---:|:---:|:---:|
+| `get_wallet_for_update(wallet_id)` | Fetches a wallet row with exclusive pessimistic lock | `wallet_id: uuid.UUID` | `Wallet \| None` | **Yes** | **Yes** (`FOR UPDATE`) | No (Read with lock) |
+| `get_asset_by_id(asset_id)` | Retrieves asset metadata by UUID | `asset_id: uuid.UUID` | `Asset \| None` | **Yes** | No | No (Read only) |
+| `get_asset_by_symbol(symbol)` | Retrieves asset metadata by ticker symbol | `symbol: str` | `Asset \| None` | **Yes** | No | No (Read only) |
+| `get_transactions_by_wallet(wallet_id, limit, offset)` | Returns paginated chronological ledger records | `wallet_id: uuid.UUID`, `limit: int = 50`, `offset: int = 0` | `Sequence[Transaction]` | **Yes** | No | No (Read only) |
+| `get_buy_quantity(wallet_id, asset_id)` | Calculates total units purchased for an asset | `wallet_id: uuid.UUID`, `asset_id: uuid.UUID` | `Decimal` | **Yes** | No (Guarded by wallet lock) | No (Read aggregate) |
+| `get_sell_quantity(wallet_id, asset_id)` | Calculates total units sold for an asset | `wallet_id: uuid.UUID`, `asset_id: uuid.UUID` | `Decimal` | **Yes** | No (Guarded by wallet lock) | No (Read aggregate) |
+| `get_net_holdings(wallet_id, asset_id)` | Computes net owned units: `SUM(BUY) - SUM(SELL)` | `wallet_id: uuid.UUID`, `asset_id: uuid.UUID` | `Decimal` | **Yes** | No (Guarded by wallet lock) | No (Read aggregate) |
+| `create_transaction(transaction)` | Stages an immutable transaction record into session | `transaction: Transaction` | `Transaction` | **Yes** | No | **Yes** (Staged INSERT) |
+| `update_wallet_balance(wallet, new_balance)` | Updates the balance on a locked wallet instance | `wallet: Wallet`, `new_balance: Decimal` | `None` | **Yes** | No (Assumes prior lock) | **Yes** (Staged UPDATE) |
+| `flush()` | Flushes pending SQL to active transaction buffer | None | `None` | **Yes** | No | **Yes** (Emits DML to DB) |
+
+#### 9.1.1 Detailed Method Analysis
+1. **`get_wallet_for_update(wallet_id: uuid.UUID) -> Wallet | None`**
+   - **SQL Emitted:** `SELECT * FROM wallets WHERE id = :wallet_id FOR UPDATE`
+   - **Behavior:** Blocks until PostgreSQL grants exclusive row lock. Under `READ COMMITTED`, returns the newly committed row state. Returns `None` if not found.
+2. **`get_asset_by_id(asset_id: uuid.UUID) -> Asset | None`**
+   - **SQL Emitted:** `SELECT * FROM assets WHERE id = :asset_id`
+   - **Behavior:** Standard non-locking read. Cached or indexed lookup on primary key.
+3. **`get_asset_by_symbol(symbol: str) -> Asset | None`**
+   - **SQL Emitted:** `SELECT * FROM assets WHERE symbol = :symbol`
+   - **Behavior:** Indexed lookup on unique symbol index (`ix_assets_symbol`).
+4. **`get_transactions_by_wallet(wallet_id: uuid.UUID, limit: int = 50, offset: int = 0) -> Sequence[Transaction]`**
+   - **SQL Emitted:** `SELECT * FROM transactions WHERE wallet_id = :wallet_id ORDER BY created_at DESC LIMIT :limit OFFSET :offset`
+   - **Behavior:** Supports pagination for transaction ledger history.
+5. **`get_buy_quantity(wallet_id: uuid.UUID, asset_id: uuid.UUID) -> Decimal`**
+   - **SQL Emitted:** `SELECT COALESCE(SUM(quantity), 0) FROM transactions WHERE wallet_id = :wallet_id AND asset_id = :asset_id AND transaction_type = 'BUY'`
+   - **Behavior:** Returns `Decimal` sum. Returns `Decimal("0")` if no buy transactions exist.
+6. **`get_sell_quantity(wallet_id: uuid.UUID, asset_id: uuid.UUID) -> Decimal`**
+   - **SQL Emitted:** `SELECT COALESCE(SUM(quantity), 0) FROM transactions WHERE wallet_id = :wallet_id AND asset_id = :asset_id AND transaction_type = 'SELL'`
+   - **Behavior:** Returns `Decimal` sum. Returns `Decimal("0")` if no sell transactions exist.
+7. **`get_net_holdings(wallet_id: uuid.UUID, asset_id: uuid.UUID) -> Decimal`**
+   - **SQL Emitted:** Single consolidated query:
+     ```sql
+     SELECT COALESCE(SUM(
+         CASE
+             WHEN transaction_type = 'BUY' THEN quantity
+             WHEN transaction_type = 'SELL' THEN -quantity
+             ELSE 0
+         END
+     ), 0)
+     FROM transactions
+     WHERE wallet_id = :wallet_id AND asset_id = :asset_id;
+     ```
+   - **Behavior:** Computes net position with mathematical precision. Always runs within the active transaction after acquiring the wallet lock.
+   - **Primary Contract Preference:** While `get_buy_quantity()` and `get_sell_quantity()` exist as atomic queries for specific ledger audits or analytics, the unified `get_net_holdings()` method is the **preferred primary contract** for trade execution. By performing the aggregation in a single database round-trip, it eliminates duplicated SQL queries, minimizes network latency, and avoids calculating the delta in application memory.
+8. **`create_transaction(transaction: Transaction) -> Transaction`**
+   - **Behavior:** Adds the `Transaction` entity to the SQLAlchemy session (`session.add(transaction)`). Does NOT issue a commit.
+9. **`flush() -> None`**
+   - **Behavior:** Invokes `await session.flush()`. Sends staged DML statements to PostgreSQL to evaluate immediate check constraints without closing or committing the transaction.
+
+---
+
+### 9.2 Async Session Lifecycle & Invariant Protection
+
+The async session lifecycle guarantees that exactly **one** database session and **one** physical database connection are utilized throughout a single trade request:
+
+```
+[ FastAPI HTTP Request ]
+          │
+          ▼
+1. get_db() dependency yields AsyncSession
+   (Bound to connection from pool; autoflush=False, expire_on_commit=False)
+          │
+          ▼
+2. API Router receives session and injects into TradingService
+   TradingService(session=session)
+          │
+          ▼
+3. Service opens transaction boundary: async with session.begin():
+   Issues BEGIN to PostgreSQL
+          │
+          ▼
+4. TradingRepository executes queries using injected session
+   (get_wallet_for_update, get_net_holdings, create_transaction)
+          │
+          ▼
+5. All operations succeed ➔ session.begin() issues COMMIT to PostgreSQL
+   (If exception occurs ➔ session.begin() issues ROLLBACK to PostgreSQL)
+          │
+          ▼
+6. API Router returns HTTP response (201 / 400 / 404 / 422)
+          │
+          ▼
+7. get_db() context generator resumes execution
+   await session.close() returns connection to pool
+```
+
+#### 9.2.1 The Eight Rules of Async Session Management
+1. **Single Session Source:** The FastAPI dependency `get_db()` is the sole creator of `AsyncSession` instances for HTTP requests.
+2. **Explicit Injection:** The active `AsyncSession` is passed explicitly from the API route handler to the service and repository layers.
+3. **Service Transaction Ownership:** The Service Layer exclusively owns the transaction boundary using `async with session.begin():`.
+4. **Repository Session Sharing:** All repository methods must accept and operate on the injected session.
+5. **No Independent Sessions:** Repositories must never instantiate their own `AsyncSession` or call `AsyncSessionLocal()`.
+6. **No Independent Commits:** Repositories must never call `session.commit()` or `session.rollback()`.
+7. **Unimpeded Exception Flow:** Exceptions occurring inside repositories must propagate unaltered to the service layer's `async with session.begin():` block.
+8. **Automatic Cleanup:** Session disposal is managed by `get_db()`, ensuring connections are always returned to the pool even during catastrophic exceptions.
+
+#### 9.2.2 Why Multiple Sessions Break Atomicity
+If a repository were to instantiate its own session or commit independently:
+- **Connection Isolation:** Each session checks out its own connection from the connection pool. Two sessions run on two separate PostgreSQL backend processes.
+- **Lock Invisibility:** Row-level locks acquired in Session 1 (`SELECT ... FOR UPDATE`) are **invisible and non-transferable** to Session 2.
+- **Uncommitted Data Hazard:** If Session 1 writes a new balance and Session 2 attempts to verify the balance or insert a transaction, Session 2 cannot see Session 1's uncommitted data under `READ COMMITTED`.
+- **Deadlock Potential:** Session 1 holding a lock on `Wallet` while Session 2 tries to update or lock the same `Wallet` will cause Session 2 to block waiting for Session 1, which may wait on Session 2, producing an instant database deadlock.
+- **Atomicity Destruction:** If Session 1 commits the balance deduction, but Session 2 fails to insert the transaction ledger record, user money is deducted with zero audit trail. The single-session model guarantees this cannot happen.
+
+---
+
+### 9.3 Practical SQLAlchemy 2.0 Async Code Examples
+
+The following illustrative pseudocode demonstrates the proposed integration across layers:
+
+#### 9.3.1 Dependency-Managed AsyncSession in FastAPI Router
+```python
+# Proposed: src/api/v1/trading.py
+from fastapi import APIRouter, Depends, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from src.core.database import get_db
+from src.schemas.trading import BuyOrderRequest, OrderResponse
+from src.services.trading_service import TradingService
+
+router = APIRouter(prefix="/trades", tags=["Trading"])
+
+@router.post("/buy", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
+async def execute_buy_order(
+    request: BuyOrderRequest,
+    session: AsyncSession = Depends(get_db),
+    # current_user: User = Depends(get_current_user),  # Authenticated user
+):
+    service = TradingService(session)
+    order_result = await service.execute_buy(
+        wallet_id=request.wallet_id,
+        asset_id=request.asset_id,
+        quantity=request.quantity,
+        price=request.price,
+    )
+    return order_result
+```
+
+#### 9.3.2 TradingService Using `session.begin()`
+```python
+# Proposed: src/services/trading_service.py
+from decimal import Decimal
+import uuid
+from sqlalchemy.ext.asyncio import AsyncSession
+from src.repositories.trading_repository import TradingRepository
+from src.models.transaction import Transaction
+from src.core.exceptions import (
+    WalletNotFoundError,
+    AssetNotFoundError,
+    AssetInactiveError,
+    InsufficientFundsError,
+)
+
+class TradingService:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+        self.repo = TradingRepository(session)
+
+    async def execute_buy(
+        self,
+        wallet_id: uuid.UUID,
+        asset_id: uuid.UUID,
+        quantity: Decimal,
+        price: Decimal,
+    ) -> Transaction:
+        # Service strictly owns the transaction boundary:
+        async with self.session.begin():
+            # 1. Acquire pessimistic lock on wallet
+            wallet = await self.repo.get_wallet_for_update(wallet_id)
+            if wallet is None:
+                raise WalletNotFoundError(wallet_id)
+
+            # 2. Validate asset
+            asset = await self.repo.get_asset_by_id(asset_id)
+            if asset is None:
+                raise AssetNotFoundError(asset_id)
+            if not asset.is_active:
+                raise AssetInactiveError(asset.symbol)
+
+            # 3. Calculate exact cost and check balance
+            total_cost = quantity * price
+            if wallet.balance < total_cost:
+                raise InsufficientFundsError(available=wallet.balance, required=total_cost)
+
+            # 4. Mutate balance
+            wallet.balance -= total_cost
+
+            # 5. Record immutable transaction
+            tx = Transaction(
+                wallet_id=wallet.id,
+                asset_id=asset.id,
+                transaction_type="BUY",
+                quantity=quantity,
+                price=price,
+                total_amount=total_cost,
+            )
+            created_tx = await self.repo.create_transaction(tx)
+
+        # session.begin() auto-commits here upon clean exit.
+        return created_tx
+```
+
+#### 9.3.3 TradingRepository Using Injected Session & `SELECT FOR UPDATE`
+```python
+# Proposed: src/repositories/trading_repository.py
+import uuid
+from decimal import Decimal
+from typing import Sequence
+from sqlalchemy import select, func, case
+from sqlalchemy.ext.asyncio import AsyncSession
+from src.models.wallet import Wallet
+from src.models.asset import Asset
+from src.models.transaction import Transaction
+
+class TradingRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def get_wallet_for_update(self, wallet_id: uuid.UUID) -> Wallet | None:
+        """Pessimistic row-level lock on wallet."""
+        stmt = (
+            select(Wallet)
+            .where(Wallet.id == wallet_id)
+            .with_for_update()
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_asset_by_id(self, asset_id: uuid.UUID) -> Asset | None:
+        """Non-locking read for asset."""
+        stmt = select(Asset).where(Asset.id == asset_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_net_holdings(self, wallet_id: uuid.UUID, asset_id: uuid.UUID) -> Decimal:
+        """Ledger-driven net holdings calculation."""
+        stmt = (
+            select(
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (Transaction.transaction_type == "BUY", Transaction.quantity),
+                            (Transaction.transaction_type == "SELL", -Transaction.quantity),
+                            else_=Decimal("0"),
+                        )
+                    ),
+                    Decimal("0"),
+                )
+            )
+            .where(Transaction.wallet_id == wallet_id)
+            .where(Transaction.asset_id == asset_id)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one()
+
+    async def create_transaction(self, transaction: Transaction) -> Transaction:
+        """Stage transaction into active session."""
+        self.session.add(transaction)
+        await self.session.flush()
+        return transaction
+```
+
+---
+
+### 9.4 Testing Strategy for Repositories & Services
+
+#### 9.4.1 Repository Layer Testing (Data Access Verification)
+- **Scope:** Verify SQL query execution, pagination offsets, filters, and mathematical aggregate accuracy.
+- **Test Database Isolation:** Repository unit/integration tests must execute against a dedicated, isolated test database schema.
+- **Fixture Lifecycle:** Each test receives a freshly created `AsyncSession` that rolls back all staged data at test completion (`yield session` followed by `await session.rollback()`).
+
+#### 9.4.2 Service Layer Testing (Transaction & Business Logic Verification)
+- **Scope:** Verify atomic commit on success, automatic rollback on exception, invariant enforcement, and domain error generation.
+- **Rollback Verification Pattern:**
+  ```python
+  @pytest.mark.asyncio
+  async def test_buy_insufficient_funds_rolls_back(test_session, trading_service, seeded_wallet):
+      initial_balance = seeded_wallet.balance
+      with pytest.raises(InsufficientFundsError):
+          await trading_service.execute_buy(
+              wallet_id=seeded_wallet.id,
+              asset_id=seeded_asset.id,
+              quantity=Decimal("1000"),
+              price=Decimal("1000"),
+          )
+      # Verify wallet was not altered in the database
+      refetched = await test_session.get(Wallet, seeded_wallet.id)
+      assert refetched.balance == initial_balance
+  ```
+
+#### 9.4.3 Testing Configuration Choices (NullPool & Loop Isolation vs. Production Pooling)
+- **Production vs. Testing Engine Configurations:**
+  - **In Production:** Connection pooling using SQLAlchemy's default `AsyncAdaptedQueuePool` (configured with connection recycling, pool size limits, and `pool_pre_ping=True`) is standard to maximize asynchronous throughput and reuse authenticated database connections under high concurrent load.
+  - **In Test Suites (Specialized Testing Choices):**
+    - **`NullPool` on Test Engines:** Using `poolclass=NullPool` (as demonstrated in `tests/integration/test_database_connection.py`) is an intentional testing configuration choice. It disables connection reuse between tests, ensuring every test session checks out a dedicated physical connection that is discarded immediately upon teardown, preventing cross-test state leakage.
+    - **Function-Scoped Fixtures & Loop Isolation:** All test session fixtures are scoped to `function` (`@pytest.fixture(scope="function")`), and `pytest.ini` configures `asyncio_default_fixture_loop_scope = function`. This guarantees that each test case runs within its own clean event loop without lingering coroutines or shared socket handles. These are test harness safeguards, not universal runtime requirements.
+
+#### 9.4.4 PostgreSQL-Specific Testing Requirements for Row-Level Locks
+- **Critical Testing Requirement:** Concurrency and locking tests (`SELECT FOR UPDATE`) **cannot** be executed against SQLite (even via in-memory mock), because SQLite implements database-level file locks and silently ignores row-level `with_for_update()` clauses.
+- **Dedicated PostgreSQL Concurrency Tests:**
+  - Concurrency tests will execute against a live PostgreSQL instance.
+  - Tests will launch multiple concurrent coroutines using `asyncio.gather()` targeting the same `wallet_id`.
+  - Verifies that PostgreSQL correctly queues concurrent transactions via `LockWait` and guarantees that double-spending is physically prevented.
+
+---
+
+## 10. Key Architectural Decisions & Invariants
+
+### 10.1 Single Source of Truth for Asset Holdings
 - **Decision:** Asset holdings are calculated directly from the immutable `transactions` ledger (`SUM(BUY) - SUM(SELL)`), rather than maintaining a separate mutable `portfolio_holdings` table.
 - **Rationale:**
   - Having a separate holdings table introduces data synchronization anomalies if an update to the holdings table fails while a ledger transaction succeeds.
   - The append-only ledger is mathematically authoritative and immutable.
   - Performance is optimized by indexing `(wallet_id, asset_id)` on the `transactions` table.
 
-### 8.2 Pessimistic Row Locking (`SELECT FOR UPDATE`)
+### 10.2 Pessimistic Row Locking (`SELECT FOR UPDATE`)
 - **Decision:** Use pessimistic locking via `with_for_update()` on the `Wallet` record during both Buy and Sell execution.
 - **Rationale:**
   - Optimistic locking (e.g., version columns) results in high retry rates and aborted transactions during rapid automated algorithmic trading spikes.
   - Pessimistic locking cleanly serializes order requests for a single wallet in PostgreSQL, ensuring wallet balance deductions/credits and holdings checks are strictly linear and race-condition free.
 
-### 8.3 Service Layer Transaction Boundary Ownership
+### 10.3 Service Layer Transaction Boundary Ownership
 - **Decision:** The transaction boundary (`async with session.begin():`) is owned strictly by the Service layer, not the API Router or Repository.
 - **Rationale:**
   - An atomic operation spans multiple repository calls (e.g., `get_wallet_for_update`, `get_asset_by_id`, `get_user_asset_holdings`, `update_balance`, and `create_transaction`).
   - If any step fails, the entire business operation must be rolled back as a single unit of work.
 
-### 8.4 Zero Floating-Point Arithmetic Policy
+### 10.4 Zero Floating-Point Arithmetic Policy
 - **Decision:** All monetary values, quantities, and prices are handled exclusively via Python's `Decimal` module and SQLAlchemy's `Numeric` column types.
 - **Rationale:**
   - Floating-point arithmetic (`float`) causes precision loss (e.g., `0.1 + 0.2 != 0.3`).
   - In AlgoTrade Pro, the database enforces a strict constraint: `total_amount = quantity * price`. Any floating point drift would violate this constraint and trigger database-level exceptions.
-
----
-
-## 9. Implementation Phasing Compliance
-
-All subsequent implementation tasks will strictly follow the established 7-phase roadmap:
-- **Phase 1:** Repository Analysis & Architecture Baseline (Days 1–2) — *Current Phase*
-- **Phase 2:** Pydantic v2 Schemas & Rigorous Validation (Days 3–5)
-- **Phase 3:** Buy Operation Implementation (Days 6–8)
-- **Phase 4:** Sell Operation Implementation (Days 9–11)
-- **Phase 5:** Transaction Integrity & Concurrency Control (Days 12–14)
-- **Phase 6:** Portfolio & Transaction History Integration (Days 15–17)
-- **Phase 7:** End-to-End Testing & Final Integration (Days 18–20)
