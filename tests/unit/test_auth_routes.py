@@ -1,4 +1,5 @@
-﻿from unittest.mock import AsyncMock, MagicMock, patch
+from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -7,7 +8,7 @@ from httpx import ASGITransport, AsyncClient
 from src.main import app
 from src.core.database import get_db
 from src.api.deps import get_current_user
-from src.models import User
+from src.models import User, Wallet
 
 
 @pytest.mark.asyncio
@@ -17,6 +18,12 @@ async def test_register_endpoint_returns_created_response():
     mock_db = MagicMock()
     mock_db.scalar = AsyncMock(return_value=None)
     mock_db.commit = AsyncMock()
+    added_objects = []
+
+    def add_entity(entity):
+        added_objects.append(entity)
+
+    mock_db.add.side_effect = add_entity
 
     async def refresh_user(user):
         user.id = user_id
@@ -47,7 +54,13 @@ async def test_register_endpoint_returns_created_response():
         assert response.json()["id"] == str(user_id)
         assert "password_hash" not in response.json()
 
-        mock_db.add.assert_called_once()
+        assert len(added_objects) == 2
+        saved_user = next(obj for obj in added_objects if isinstance(obj, User))
+        saved_wallet = next(obj for obj in added_objects if isinstance(obj, Wallet))
+        assert saved_user.id == user_id
+        assert saved_wallet.user is saved_user
+        assert saved_wallet.balance == Decimal("0")
+        assert saved_wallet.currency == "USD"
         mock_db.commit.assert_awaited_once()
 
     finally:

@@ -1,4 +1,5 @@
-﻿from fastapi import APIRouter, Depends, HTTPException, status
+from decimal import Decimal
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,7 +8,7 @@ from src.api.deps import get_current_user
 from src.core.database import get_db
 from src.core.jwt import create_access_token
 from src.core.security import hash_password, verify_password
-from src.models import User
+from src.models import User, Wallet
 from src.schemas.auth import (
     TokenResponse,
     UserLogin,
@@ -28,7 +29,7 @@ async def register_user(
     user_data: UserRegister,
     db: AsyncSession = Depends(get_db),
 ) -> UserResponse:
-    """Register a new user account."""
+    """Register a user and automatically provision their wallet."""
 
     normalized_email = str(user_data.email).lower()
 
@@ -47,7 +48,14 @@ async def register_user(
         password_hash=hash_password(user_data.password),
     )
 
+    wallet = Wallet(
+        user=user,
+        balance=Decimal("0"),
+        currency="USD",
+    )
+
     db.add(user)
+    db.add(wallet)
 
     try:
         await db.commit()
@@ -60,7 +68,6 @@ async def register_user(
         ) from None
 
     return UserResponse.model_validate(user)
-
 
 @router.post(
     "/login",
