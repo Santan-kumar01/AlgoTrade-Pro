@@ -1,4 +1,5 @@
-﻿from unittest.mock import AsyncMock, MagicMock, patch
+from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -7,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 
 from src.api.auth import login_user, register_user
 from src.core.security import verify_password
-from src.models import User
+from src.models import User, Wallet
 from src.schemas.auth import UserLogin, UserRegister
 
 
@@ -18,10 +19,14 @@ async def test_successful_user_registration():
     db.commit = AsyncMock()
     db.refresh = AsyncMock()
 
-    def add_user(user):
-        user.id = uuid4()
+    added_objects = []
 
-    db.add.side_effect = add_user
+    def add_entity(entity):
+        added_objects.append(entity)
+        if isinstance(entity, User):
+            entity.id = uuid4()
+
+    db.add.side_effect = add_entity
 
     user_data = UserRegister(
         email="test@example.com",
@@ -30,17 +35,27 @@ async def test_successful_user_registration():
 
     response = await register_user(user_data, db)
 
-    saved_user = db.add.call_args.args[0]
+    saved_user = next(
+        obj for obj in added_objects if isinstance(obj, User)
+    )
+    saved_wallet = next(
+        obj for obj in added_objects if isinstance(obj, Wallet)
+    )
 
-    assert isinstance(saved_user, User)
     assert response.email == "test@example.com"
     assert response.id == saved_user.id
+
     assert verify_password(
         "StrongPass@2026",
         saved_user.password_hash,
     )
     assert saved_user.password_hash != "StrongPass@2026"
 
+    assert saved_wallet.user is saved_user
+    assert saved_wallet.balance == Decimal("0")
+    assert saved_wallet.currency == "USD"
+
+    assert len(added_objects) == 2
     db.commit.assert_awaited_once()
     db.refresh.assert_awaited_once_with(saved_user)
 

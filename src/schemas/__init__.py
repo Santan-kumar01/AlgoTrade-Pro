@@ -1,4 +1,5 @@
-﻿from src.schemas.auth import (
+from src.schemas.wallet import WalletResponse
+from src.schemas.auth import (
     TokenResponse,
     UserLogin,
     UserRegister,
@@ -10,4 +11,5 @@ __all__ = [
     "UserLogin",
     "UserRegister",
     "UserResponse",
+    "WalletResponse",
 ]
