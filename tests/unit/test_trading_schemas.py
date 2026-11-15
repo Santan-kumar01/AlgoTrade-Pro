@@ -15,6 +15,7 @@ from src.schemas.trading import (
     SellOrderRequest as DirectSellOrderRequest,
     TradeResponse as DirectTradeResponse,
     TradeType as DirectTradeType,
+    validate_decimal_precision,
 )
 
 
@@ -451,3 +452,315 @@ def test_sell_order_request_rejects_negative_price():
             quantity=Decimal("5"),
             price=Decimal("-99.99"),
         )
+
+
+def test_buy_order_request_accepts_integer_values():
+    """Verify BuyOrderRequest accepts valid integer quantities and prices."""
+    order = BuyOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("100"),
+        price=Decimal("250"),
+    )
+    assert order.quantity == Decimal("100")
+    assert order.price == Decimal("250")
+
+
+def test_buy_order_request_accepts_two_decimal_places():
+    """Verify BuyOrderRequest accepts values with 2 decimal places."""
+    order = BuyOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("10.50"),
+        price=Decimal("199.99"),
+    )
+    assert order.quantity == Decimal("10.50")
+    assert order.price == Decimal("199.99")
+
+
+def test_buy_order_request_accepts_exact_eight_decimal_places():
+    """Verify BuyOrderRequest accepts values with exactly 8 decimal places."""
+    order = BuyOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("0.12345678"),
+        price=Decimal("150.87654321"),
+    )
+    assert order.quantity == Decimal("0.12345678")
+    assert order.price == Decimal("150.87654321")
+
+
+def test_buy_order_request_rejects_more_than_eight_decimal_places():
+    """Verify BuyOrderRequest rejects values with more than 8 meaningful decimal places."""
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("10.123456789"),
+            price=Decimal("100.00"),
+        )
+
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("10.00"),
+            price=Decimal("100.123456789"),
+        )
+
+
+def test_buy_order_request_accepts_trailing_zeros_beyond_eight_places():
+    """Verify BuyOrderRequest accepts values with trailing zeros beyond 8 places."""
+    order = BuyOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("1.230000000"),
+        price=Decimal("50.0000000000"),
+    )
+    assert order.quantity == Decimal("1.230000000")
+    assert order.price == Decimal("50.0000000000")
+
+
+def test_buy_order_request_handles_scientific_notation():
+    """Verify BuyOrderRequest handles scientific notation correctly."""
+    valid_order = BuyOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("1e-5"),
+        price=Decimal("1e-8"),
+    )
+    assert valid_order.quantity == Decimal("1e-5")
+    assert valid_order.price == Decimal("1e-8")
+
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("1e-9"),
+            price=Decimal("100"),
+        )
+
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("10"),
+            price=Decimal("1e-9"),
+        )
+
+
+def test_buy_order_request_precision_boundaries():
+    """Verify BuyOrderRequest respects Numeric(24, 8) precision boundaries."""
+    max_boundary_order = BuyOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("9999999999999999.99999999"),
+        price=Decimal("9999999999999999"),
+    )
+    assert max_boundary_order.quantity == Decimal("9999999999999999.99999999")
+    assert max_boundary_order.price == Decimal("9999999999999999")
+
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("10000000000000000"),
+            price=Decimal("100"),
+        )
+
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("10"),
+            price=Decimal("10000000000000000"),
+        )
+
+
+def test_sell_order_request_accepts_integer_values():
+    """Verify SellOrderRequest accepts valid integer quantities and prices."""
+    order = SellOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("50"),
+        price=Decimal("300"),
+    )
+    assert order.quantity == Decimal("50")
+    assert order.price == Decimal("300")
+
+
+def test_sell_order_request_accepts_two_decimal_places():
+    """Verify SellOrderRequest accepts values with 2 decimal places."""
+    order = SellOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("5.25"),
+        price=Decimal("79.95"),
+    )
+    assert order.quantity == Decimal("5.25")
+    assert order.price == Decimal("79.95")
+
+
+def test_sell_order_request_accepts_exact_eight_decimal_places():
+    """Verify SellOrderRequest accepts values with exactly 8 decimal places."""
+    order = SellOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("0.87654321"),
+        price=Decimal("250.12345678"),
+    )
+    assert order.quantity == Decimal("0.87654321")
+    assert order.price == Decimal("250.12345678")
+
+
+def test_sell_order_request_rejects_more_than_eight_decimal_places():
+    """Verify SellOrderRequest rejects values with more than 8 meaningful decimal places."""
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("1.123456789"),
+            price=Decimal("50.00"),
+        )
+
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("1.00"),
+            price=Decimal("50.123456789"),
+        )
+
+
+def test_sell_order_request_accepts_trailing_zeros_beyond_eight_places():
+    """Verify SellOrderRequest accepts values with trailing zeros beyond 8 places."""
+    order = SellOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("2.45000000000"),
+        price=Decimal("120.750000000"),
+    )
+    assert order.quantity == Decimal("2.45000000000")
+    assert order.price == Decimal("120.750000000")
+
+
+def test_sell_order_request_handles_scientific_notation():
+    """Verify SellOrderRequest handles scientific notation correctly."""
+    valid_order = SellOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("1e-5"),
+        price=Decimal("1e-8"),
+    )
+    assert valid_order.quantity == Decimal("1e-5")
+    assert valid_order.price == Decimal("1e-8")
+
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("1e-9"),
+            price=Decimal("50"),
+        )
+
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("5"),
+            price=Decimal("1e-9"),
+        )
+
+
+def test_sell_order_request_precision_boundaries():
+    """Verify SellOrderRequest respects Numeric(24, 8) precision boundaries."""
+    max_boundary_order = SellOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("9999999999999999.99999999"),
+        price=Decimal("9999999999999999"),
+    )
+    assert max_boundary_order.quantity == Decimal("9999999999999999.99999999")
+    assert max_boundary_order.price == Decimal("9999999999999999")
+
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("10000000000000000"),
+            price=Decimal("50"),
+        )
+
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("5"),
+            price=Decimal("10000000000000000"),
+        )
+
+
+def test_validate_decimal_precision_returns_original_instance():
+    """Verify validate_decimal_precision returns the original Decimal object unchanged."""
+    d = Decimal("1.230000000")
+    result = validate_decimal_precision(d)
+    assert result is d
+    assert result == d
+
+
+def test_validate_decimal_precision_handles_zero_safely():
+    """Verify validate_decimal_precision handles zero values safely."""
+    zero_dec = Decimal("0")
+    assert validate_decimal_precision(zero_dec) is zero_dec
+
+    zero_places = Decimal("0.00000000")
+    assert validate_decimal_precision(zero_places) is zero_places
+
+
+def test_orders_reject_very_large_scientific_notation():
+    """Verify orders reject extreme large scientific notation values exceeding 16 integer digits."""
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("1e16"),
+            price=Decimal("100"),
+        )
+
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("10"),
+            price=Decimal("1e100"),
+        )
+
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("1e16"),
+            price=Decimal("100"),
+        )
+
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("10"),
+            price=Decimal("1e100"),
+        )
+
+
+def test_orders_reject_very_small_scientific_notation():
+    """Verify orders reject extreme small scientific notation values exceeding 8 decimal places."""
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("1e-100"),
+            price=Decimal("100"),
+        )
+
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("10"),
+            price=Decimal("1e-100"),
+        )
+
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("1e-100"),
+            price=Decimal("100"),
+        )
+
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("10"),
+            price=Decimal("1e-100"),
+        )
+
+
+def test_orders_accept_exact_sixteen_integer_digit_boundary():
+    """Verify orders accept exactly 16 integer digits (e.g. 1e15)."""
+    order = BuyOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("1e15"),
+        price=Decimal("1e15"),
+    )
+    assert order.quantity == Decimal("1e15")
+    assert order.price == Decimal("1e15")
