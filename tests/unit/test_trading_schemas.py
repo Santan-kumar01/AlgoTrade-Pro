@@ -349,3 +349,105 @@ def test_trade_response_rejects_invalid_types():
             total_amount=Decimal("1"),
             created_at="not-a-datetime",
         )
+
+
+def test_buy_order_request_accepts_positive_quantity_and_price():
+    """Verify BuyOrderRequest accepts strictly positive quantity and price."""
+    order = BuyOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("0.00000001"),
+        price=Decimal("0.01"),
+    )
+    assert order.quantity == Decimal("0.00000001")
+    assert order.price == Decimal("0.01")
+
+
+def test_buy_order_request_rejects_zero_quantity():
+    """Verify BuyOrderRequest rejects zero quantity."""
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("0"),
+            price=Decimal("100"),
+        )
+
+
+def test_buy_order_request_rejects_negative_quantity():
+    """Verify BuyOrderRequest rejects negative quantity."""
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("-5.5"),
+            price=Decimal("100"),
+        )
+
+
+def test_buy_order_request_rejects_zero_price():
+    """Verify BuyOrderRequest rejects zero price."""
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("10"),
+            price=Decimal("0"),
+        )
+
+
+def test_buy_order_request_rejects_negative_price():
+    """Verify BuyOrderRequest rejects negative price."""
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("10"),
+            price=Decimal("-150.25"),
+        )
+
+
+def test_sell_order_request_accepts_positive_quantity_and_price():
+    """Verify SellOrderRequest accepts strictly positive quantity and price."""
+    order = SellOrderRequest(
+        asset_id=uuid.uuid4(),
+        quantity=Decimal("0.00000001"),
+        price=Decimal("0.01"),
+    )
+    assert order.quantity == Decimal("0.00000001")
+    assert order.price == Decimal("0.01")
+
+
+def test_sell_order_request_rejects_zero_quantity():
+    """Verify SellOrderRequest rejects zero quantity."""
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("0"),
+            price=Decimal("50"),
+        )
+
+
+def test_sell_order_request_rejects_negative_quantity():
+    """Verify SellOrderRequest rejects negative quantity."""
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("-2.5"),
+            price=Decimal("50"),
+        )
+
+
+def test_sell_order_request_rejects_zero_price():
+    """Verify SellOrderRequest rejects zero price."""
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("5"),
+            price=Decimal("0"),
+        )
+
+
+def test_sell_order_request_rejects_negative_price():
+    """Verify SellOrderRequest rejects negative price."""
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("5"),
+            price=Decimal("-99.99"),
+        )
