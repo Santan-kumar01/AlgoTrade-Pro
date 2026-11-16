@@ -26,6 +26,22 @@ class WalletRepository:
         result = await session.execute(statement)
         return result.scalar_one_or_none()
 
+    async def get_wallet_for_user_update(
+        self,
+        user_id: UUID,
+        session: AsyncSession,
+    ) -> Wallet | None:
+        """Retrieve and lock a user's wallet for an atomic trade."""
+
+        statement = (
+            select(Wallet)
+            .where(Wallet.user_id == user_id)
+            .with_for_update()
+        )
+
+        result = await session.execute(statement)
+        return result.scalar_one_or_none()
+
     async def get_wallet_by_user_id(
         self,
         user_id: UUID,
