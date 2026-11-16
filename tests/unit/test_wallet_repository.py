@@ -99,3 +99,51 @@ async def test_update_balance_changes_wallet_balance():
 
     assert returned_wallet is wallet
     assert wallet.balance == Decimal("75.00")
+
+@pytest.mark.asyncio
+async def test_get_wallet_for_user_update_uses_row_lock():
+    user_id = uuid4()
+    wallet = Wallet(
+        id=uuid4(),
+        user_id=user_id,
+        balance=Decimal("100.00"),
+        currency="USD",
+    )
+
+    session = MagicMock()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = wallet
+    session.execute = AsyncMock(return_value=result)
+
+    repository = WalletRepository()
+
+    returned_wallet = await repository.get_wallet_for_user_update(
+        user_id,
+        session,
+    )
+
+    statement = session.execute.await_args.args[0]
+
+    assert isinstance(statement, Select)
+    assert returned_wallet is wallet
+    assert statement._for_update_arg is not None
+
+
+@pytest.mark.asyncio
+async def test_get_wallet_for_user_update_returns_none_when_missing():
+    user_id = uuid4()
+
+    session = MagicMock()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = None
+    session.execute = AsyncMock(return_value=result)
+
+    repository = WalletRepository()
+
+    returned_wallet = await repository.get_wallet_for_user_update(
+        user_id,
+        session,
+    )
+
+    assert returned_wallet is None
+    session.execute.assert_awaited_once()
