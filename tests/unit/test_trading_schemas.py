@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from decimal import Decimal
+import json
 import uuid
 import pytest
 from pydantic import ValidationError
@@ -764,3 +765,431 @@ def test_orders_accept_exact_sixteen_integer_digit_boundary():
     )
     assert order.quantity == Decimal("1e15")
     assert order.price == Decimal("1e15")
+
+
+def test_buy_order_request_missing_required_fields():
+    """Verify BuyOrderRequest raises ValidationError when required fields are missing."""
+    valid_uuid = uuid.uuid4()
+    valid_dec = Decimal("10")
+
+    # Missing asset_id
+    with pytest.raises(ValidationError) as exc_info:
+        BuyOrderRequest(quantity=valid_dec, price=valid_dec)
+    errors = exc_info.value.errors()
+    assert any(e["loc"] == ("asset_id",) and e["type"] == "missing" for e in errors)
+
+    # Missing quantity
+    with pytest.raises(ValidationError) as exc_info:
+        BuyOrderRequest(asset_id=valid_uuid, price=valid_dec)
+    errors = exc_info.value.errors()
+    assert any(e["loc"] == ("quantity",) and e["type"] == "missing" for e in errors)
+
+    # Missing price
+    with pytest.raises(ValidationError) as exc_info:
+        BuyOrderRequest(asset_id=valid_uuid, quantity=valid_dec)
+    errors = exc_info.value.errors()
+    assert any(e["loc"] == ("price",) and e["type"] == "missing" for e in errors)
+
+    # Empty payload
+    with pytest.raises(ValidationError) as exc_info:
+        BuyOrderRequest.model_validate({})
+    assert len(exc_info.value.errors()) == 3
+
+
+def test_sell_order_request_missing_required_fields():
+    """Verify SellOrderRequest raises ValidationError when required fields are missing."""
+    valid_uuid = uuid.uuid4()
+    valid_dec = Decimal("5")
+
+    # Missing asset_id
+    with pytest.raises(ValidationError) as exc_info:
+        SellOrderRequest(quantity=valid_dec, price=valid_dec)
+    errors = exc_info.value.errors()
+    assert any(e["loc"] == ("asset_id",) and e["type"] == "missing" for e in errors)
+
+    # Missing quantity
+    with pytest.raises(ValidationError) as exc_info:
+        SellOrderRequest(asset_id=valid_uuid, price=valid_dec)
+    errors = exc_info.value.errors()
+    assert any(e["loc"] == ("quantity",) and e["type"] == "missing" for e in errors)
+
+    # Missing price
+    with pytest.raises(ValidationError) as exc_info:
+        SellOrderRequest(asset_id=valid_uuid, quantity=valid_dec)
+    errors = exc_info.value.errors()
+    assert any(e["loc"] == ("price",) and e["type"] == "missing" for e in errors)
+
+    # Empty payload
+    with pytest.raises(ValidationError) as exc_info:
+        SellOrderRequest.model_validate({})
+    assert len(exc_info.value.errors()) == 3
+
+
+def test_trade_response_missing_required_fields():
+    """Verify TradeResponse raises ValidationError when any required field is missing."""
+    now = datetime.now(timezone.utc)
+    valid_data = {
+        "id": uuid.uuid4(),
+        "wallet_id": uuid.uuid4(),
+        "asset_id": uuid.uuid4(),
+        "transaction_type": TradeType.BUY,
+        "quantity": Decimal("10"),
+        "price": Decimal("100"),
+        "total_amount": Decimal("1000"),
+        "created_at": now,
+    }
+
+    for key in valid_data:
+        incomplete_data = {k: v for k, v in valid_data.items() if k != key}
+        with pytest.raises(ValidationError) as exc_info:
+            TradeResponse.model_validate(incomplete_data)
+        assert any(
+            e["loc"] == (key,) and e["type"] == "missing"
+            for e in exc_info.value.errors()
+        )
+
+
+@pytest.mark.parametrize("invalid_uuid", [12345, True, ["not-a-uuid"], {"id": 1}])
+def test_buy_order_request_rejects_non_uuid_types(invalid_uuid):
+    """Verify BuyOrderRequest rejects non-string and non-UUID types."""
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=invalid_uuid,
+            quantity=Decimal("10"),
+            price=Decimal("100"),
+        )
+
+
+@pytest.mark.parametrize("invalid_uuid", [12345, True, ["not-a-uuid"], {"id": 1}])
+def test_sell_order_request_rejects_non_uuid_types(invalid_uuid):
+    """Verify SellOrderRequest rejects non-string and non-UUID types."""
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=invalid_uuid,
+            quantity=Decimal("5"),
+            price=Decimal("50"),
+        )
+
+
+@pytest.mark.parametrize("invalid_uuid", [12345, True, ["not-a-uuid"], {"id": 1}])
+def test_trade_response_rejects_non_uuid_types(invalid_uuid):
+    """Verify TradeResponse rejects non-UUID types for id, wallet_id, and asset_id."""
+    now = datetime.now(timezone.utc)
+    valid_id = uuid.uuid4()
+
+    with pytest.raises(ValidationError):
+        TradeResponse(
+            id=invalid_uuid,
+            wallet_id=valid_id,
+            asset_id=valid_id,
+            transaction_type=TradeType.BUY,
+            quantity=Decimal("1"),
+            price=Decimal("100"),
+            total_amount=Decimal("100"),
+            created_at=now,
+        )
+
+    with pytest.raises(ValidationError):
+        TradeResponse(
+            id=valid_id,
+            wallet_id=invalid_uuid,
+            asset_id=valid_id,
+            transaction_type=TradeType.BUY,
+            quantity=Decimal("1"),
+            price=Decimal("100"),
+            total_amount=Decimal("100"),
+            created_at=now,
+        )
+
+    with pytest.raises(ValidationError):
+        TradeResponse(
+            id=valid_id,
+            wallet_id=valid_id,
+            asset_id=invalid_uuid,
+            transaction_type=TradeType.BUY,
+            quantity=Decimal("1"),
+            price=Decimal("100"),
+            total_amount=Decimal("100"),
+            created_at=now,
+        )
+
+
+@pytest.mark.parametrize(
+    "non_finite", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")]
+)
+def test_buy_order_request_rejects_non_finite_decimals(non_finite):
+    """Verify BuyOrderRequest rejects non-finite Decimals (NaN, Infinity, -Infinity)."""
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=non_finite,
+            price=Decimal("100"),
+        )
+
+    with pytest.raises(ValidationError):
+        BuyOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("10"),
+            price=non_finite,
+        )
+
+
+@pytest.mark.parametrize(
+    "non_finite", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")]
+)
+def test_sell_order_request_rejects_non_finite_decimals(non_finite):
+    """Verify SellOrderRequest rejects non-finite Decimals (NaN, Infinity, -Infinity)."""
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=non_finite,
+            price=Decimal("50"),
+        )
+
+    with pytest.raises(ValidationError):
+        SellOrderRequest(
+            asset_id=uuid.uuid4(),
+            quantity=Decimal("5"),
+            price=non_finite,
+        )
+
+
+@pytest.mark.parametrize(
+    "non_finite", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")]
+)
+def test_validate_decimal_precision_rejects_non_finite_values(non_finite):
+    """Verify validate_decimal_precision directly raises ValueError for non-finite values."""
+    with pytest.raises(ValueError, match="Value must be a finite decimal number."):
+        validate_decimal_precision(non_finite)
+
+
+def test_validate_decimal_precision_rejects_excessive_scale():
+    """Verify validate_decimal_precision directly raises ValueError for scale > 8."""
+    with pytest.raises(
+        ValueError, match="Value exceeds maximum allowed scale of 8 decimal places."
+    ):
+        validate_decimal_precision(Decimal("1.123456789"))
+
+
+def test_validate_decimal_precision_rejects_excessive_integer_digits():
+    """Verify validate_decimal_precision directly raises ValueError for integer digits > 16."""
+    with pytest.raises(
+        ValueError, match="Value exceeds maximum allowed whole digits of 16"
+    ):
+        validate_decimal_precision(Decimal("10000000000000000"))
+
+
+def test_trade_response_from_orm_attributes_with_sell():
+    """Verify TradeResponse validates an ORM object with transaction_type='SELL'."""
+    class MockSellTransaction:
+        id = uuid.uuid4()
+        wallet_id = uuid.uuid4()
+        asset_id = uuid.uuid4()
+        transaction_type = "SELL"
+        quantity = Decimal("4.50000000")
+        price = Decimal("250.00000000")
+        total_amount = Decimal("1125.00000000")
+        created_at = datetime.now(timezone.utc)
+
+    mock_tx = MockSellTransaction()
+    response = TradeResponse.model_validate(mock_tx)
+
+    assert response.id == mock_tx.id
+    assert response.wallet_id == mock_tx.wallet_id
+    assert response.asset_id == mock_tx.asset_id
+    assert response.transaction_type == TradeType.SELL
+    assert response.transaction_type == "SELL"
+    assert response.quantity == Decimal("4.50000000")
+    assert response.price == Decimal("250.00000000")
+    assert response.total_amount == Decimal("1125.00000000")
+    assert response.created_at == mock_tx.created_at
+
+
+def test_trade_response_from_orm_attributes_missing_attribute():
+    """Verify TradeResponse raises ValidationError when ORM object lacks required attributes."""
+    class IncompleteTransaction:
+        id = uuid.uuid4()
+        wallet_id = uuid.uuid4()
+        asset_id = uuid.uuid4()
+        transaction_type = "BUY"
+        quantity = Decimal("1.00000000")
+        price = Decimal("100.00000000")
+        # missing total_amount and created_at
+
+    with pytest.raises(ValidationError) as exc_info:
+        TradeResponse.model_validate(IncompleteTransaction())
+    missing_fields = {e["loc"][0] for e in exc_info.value.errors()}
+    assert "total_amount" in missing_fields
+    assert "created_at" in missing_fields
+
+
+def test_buy_order_request_model_dump_and_serialization():
+    """Verify BuyOrderRequest model_dump, model_dump(mode='json'), and model_dump_json."""
+    asset_id = uuid.uuid4()
+    order = BuyOrderRequest(
+        asset_id=asset_id,
+        quantity=Decimal("10.50000000"),
+        price=Decimal("150.25000000"),
+    )
+
+    # Python dict dump
+    dump_dict = order.model_dump()
+    assert dump_dict == {
+        "asset_id": asset_id,
+        "quantity": Decimal("10.50000000"),
+        "price": Decimal("150.25000000"),
+    }
+    assert isinstance(dump_dict["asset_id"], uuid.UUID)
+    assert isinstance(dump_dict["quantity"], Decimal)
+    assert isinstance(dump_dict["price"], Decimal)
+
+    # JSON mode dump
+    json_mode_dict = order.model_dump(mode="json")
+    assert json_mode_dict["asset_id"] == str(asset_id)
+    assert json_mode_dict["quantity"] == "10.50000000"
+    assert json_mode_dict["price"] == "150.25000000"
+
+    # JSON string round-trip
+    json_str = order.model_dump_json()
+    parsed_json = json.loads(json_str)
+    assert parsed_json == json_mode_dict
+
+
+def test_sell_order_request_model_dump_and_serialization():
+    """Verify SellOrderRequest model_dump, model_dump(mode='json'), and model_dump_json."""
+    asset_id = uuid.uuid4()
+    order = SellOrderRequest(
+        asset_id=asset_id,
+        quantity=Decimal("5.00000000"),
+        price=Decimal("200.75000000"),
+    )
+
+    # Python dict dump
+    dump_dict = order.model_dump()
+    assert dump_dict == {
+        "asset_id": asset_id,
+        "quantity": Decimal("5.00000000"),
+        "price": Decimal("200.75000000"),
+    }
+    assert isinstance(dump_dict["asset_id"], uuid.UUID)
+    assert isinstance(dump_dict["quantity"], Decimal)
+    assert isinstance(dump_dict["price"], Decimal)
+
+    # JSON mode dump
+    json_mode_dict = order.model_dump(mode="json")
+    assert json_mode_dict["asset_id"] == str(asset_id)
+    assert json_mode_dict["quantity"] == "5.00000000"
+    assert json_mode_dict["price"] == "200.75000000"
+
+    # JSON string round-trip
+    json_str = order.model_dump_json()
+    parsed_json = json.loads(json_str)
+    assert parsed_json == json_mode_dict
+
+
+def test_trade_response_model_dump_and_serialization():
+    """Verify TradeResponse model_dump, model_dump(mode='json'), and model_dump_json."""
+    tx_id = uuid.uuid4()
+    wallet_id = uuid.uuid4()
+    asset_id = uuid.uuid4()
+    now = datetime(2026, 11, 16, 12, 0, 0, tzinfo=timezone.utc)
+
+    response = TradeResponse(
+        id=tx_id,
+        wallet_id=wallet_id,
+        asset_id=asset_id,
+        transaction_type=TradeType.BUY,
+        quantity=Decimal("10.00000000"),
+        price=Decimal("150.50000000"),
+        total_amount=Decimal("1505.00000000"),
+        created_at=now,
+    )
+
+    # Python dict dump
+    dump_dict = response.model_dump()
+    assert dump_dict == {
+        "id": tx_id,
+        "wallet_id": wallet_id,
+        "asset_id": asset_id,
+        "transaction_type": TradeType.BUY,
+        "quantity": Decimal("10.00000000"),
+        "price": Decimal("150.50000000"),
+        "total_amount": Decimal("1505.00000000"),
+        "created_at": now,
+    }
+    assert isinstance(dump_dict["transaction_type"], TradeType)
+    assert isinstance(dump_dict["quantity"], Decimal)
+
+    # JSON mode dump
+    json_mode_dict = response.model_dump(mode="json")
+    assert json_mode_dict["id"] == str(tx_id)
+    assert json_mode_dict["wallet_id"] == str(wallet_id)
+    assert json_mode_dict["asset_id"] == str(asset_id)
+    assert json_mode_dict["transaction_type"] == "BUY"
+    assert json_mode_dict["quantity"] == "10.00000000"
+    assert json_mode_dict["price"] == "150.50000000"
+    assert json_mode_dict["total_amount"] == "1505.00000000"
+    assert json_mode_dict["created_at"] == "2026-11-16T12:00:00Z"
+
+    # JSON string round-trip
+    json_str = response.model_dump_json()
+    parsed_json = json.loads(json_str)
+    assert parsed_json == json_mode_dict
+
+
+def test_buy_order_request_ignores_extra_fields():
+    """Verify BuyOrderRequest ignores extra unexpected fields without error."""
+    asset_id = uuid.uuid4()
+    order = BuyOrderRequest(
+        asset_id=asset_id,
+        quantity=Decimal("10"),
+        price=Decimal("100"),
+        unexpected_field="ignored_value",
+    )
+    assert not hasattr(order, "unexpected_field")
+    assert order.asset_id == asset_id
+
+
+def test_sell_order_request_ignores_extra_fields():
+    """Verify SellOrderRequest ignores extra unexpected fields without error."""
+    asset_id = uuid.uuid4()
+    order = SellOrderRequest(
+        asset_id=asset_id,
+        quantity=Decimal("5"),
+        price=Decimal("50"),
+        unexpected_field="ignored_value",
+    )
+    assert not hasattr(order, "unexpected_field")
+    assert order.asset_id == asset_id
+
+
+def test_orders_parse_decimal_strings_with_whitespace():
+    """Verify BuyOrderRequest and SellOrderRequest parse decimal strings with whitespace."""
+    asset_id = uuid.uuid4()
+    buy_order = BuyOrderRequest(
+        asset_id=asset_id,
+        quantity="  10.50000000  ",
+        price="  150.25000000  ",
+    )
+    assert buy_order.quantity == Decimal("10.50000000")
+    assert buy_order.price == Decimal("150.25000000")
+
+    sell_order = SellOrderRequest(
+        asset_id=asset_id,
+        quantity="  5.12500000  ",
+        price="  75.50000000  ",
+    )
+    assert sell_order.quantity == Decimal("5.12500000")
+    assert sell_order.price == Decimal("75.50000000")
+
+
+def test_trade_type_enum_invalid_value_lookup():
+    """Verify TradeType raises ValueError for invalid enum values."""
+    with pytest.raises(ValueError):
+        TradeType("HOLD")
+
+    with pytest.raises(ValueError):
+        TradeType("buy")
+
+    with pytest.raises(ValueError):
+        TradeType("SELL_SHORT")
