@@ -5,6 +5,8 @@ import uuid
 import pytest
 from pydantic import ValidationError
 
+from src.models.transaction import Transaction
+
 from src.schemas import (
     BuyOrderRequest,
     SellOrderRequest,
@@ -1193,3 +1195,73 @@ def test_trade_type_enum_invalid_value_lookup():
 
     with pytest.raises(ValueError):
         TradeType("SELL_SHORT")
+
+
+def test_trade_response_from_sqlalchemy_transaction_model():
+    """Verify TradeResponse validates directly from an actual SQLAlchemy Transaction model instance."""
+    now = datetime.now(timezone.utc)
+    tx = Transaction(
+        id=uuid.uuid4(),
+        wallet_id=uuid.uuid4(),
+        asset_id=uuid.uuid4(),
+        transaction_type="BUY",
+        quantity=Decimal("12.50000000"),
+        price=Decimal("175.25000000"),
+        total_amount=Decimal("2190.62500000"),
+        created_at=now,
+    )
+
+    response = TradeResponse.model_validate(tx)
+    assert response.id == tx.id
+    assert response.wallet_id == tx.wallet_id
+    assert response.asset_id == tx.asset_id
+    assert response.transaction_type == TradeType.BUY
+    assert response.quantity == Decimal("12.50000000")
+    assert response.price == Decimal("175.25000000")
+    assert response.total_amount == Decimal("2190.62500000")
+    assert response.created_at == now
+
+
+def test_orders_deserialization_from_raw_json_payload():
+    """Verify BuyOrderRequest and SellOrderRequest validate directly from raw JSON string payloads."""
+    raw_asset_id = str(uuid.uuid4())
+    raw_buy_json = json.dumps({
+        "asset_id": raw_asset_id,
+        "quantity": "25.00000000",
+        "price": "100.50000000",
+    })
+    buy_order = BuyOrderRequest.model_validate_json(raw_buy_json)
+    assert buy_order.asset_id == uuid.UUID(raw_asset_id)
+    assert buy_order.quantity == Decimal("25.00000000")
+    assert buy_order.price == Decimal("100.50000000")
+
+    raw_sell_json = json.dumps({
+        "asset_id": raw_asset_id,
+        "quantity": "15.75000000",
+        "price": "300.25000000",
+    })
+    sell_order = SellOrderRequest.model_validate_json(raw_sell_json)
+    assert sell_order.asset_id == uuid.UUID(raw_asset_id)
+    assert sell_order.quantity == Decimal("15.75000000")
+    assert sell_order.price == Decimal("300.25000000")
+
+
+def test_orders_accept_uuid_format_variations():
+    """Verify BuyOrderRequest and SellOrderRequest parse uppercase and unhyphenated UUID formats."""
+    expected_uuid = uuid.uuid4()
+    uppercase_uuid = str(expected_uuid).upper()
+    unhyphenated_uuid = expected_uuid.hex
+
+    buy_upper = BuyOrderRequest(
+        asset_id=uppercase_uuid,
+        quantity=Decimal("1"),
+        price=Decimal("10"),
+    )
+    assert buy_upper.asset_id == expected_uuid
+
+    sell_hex = SellOrderRequest(
+        asset_id=unhyphenated_uuid,
+        quantity=Decimal("2"),
+        price=Decimal("20"),
+    )
+    assert sell_hex.asset_id == expected_uuid
