@@ -8,13 +8,25 @@ from src.core.config import settings
 
 @pytest.fixture
 async def db_engine():
-    """Create an isolated database engine for each test."""
+    """Create an isolated engine for the dedicated test database."""
     test_engine = create_async_engine(
         settings.database_url,
         poolclass=NullPool,
     )
 
     try:
+        async with test_engine.connect() as connection:
+            result = await connection.execute(
+                text("SELECT current_database()")
+            )
+            database_name = result.scalar_one()
+
+            if database_name != "algotrade_pro_test":
+                raise RuntimeError(
+                    "Integration tests require algotrade_pro_test. "
+                    f"Connected database: {database_name}"
+                )
+
         yield test_engine
     finally:
         await test_engine.dispose()
@@ -30,9 +42,9 @@ async def test_postgresql_connection(db_engine: AsyncEngine):
 
 @pytest.mark.asyncio
 async def test_database_name(db_engine: AsyncEngine):
-    """Verify the active database name."""
+    """Verify the dedicated integration test database."""
     async with db_engine.connect() as connection:
         result = await connection.execute(
             text("SELECT current_database()")
         )
-        assert result.scalar_one() == "algotrade_pro"
+        assert result.scalar_one() == "algotrade_pro_test"
