@@ -170,6 +170,7 @@ async def test_execute_buy_rejects_missing_asset(trading_setup):
         )
 
     setup["wallet_repo"].update_balance.assert_not_awaited()
+    setup["trading_repo"].create_transaction.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -187,6 +188,7 @@ async def test_execute_buy_rejects_inactive_asset(trading_setup):
         )
 
     setup["wallet_repo"].update_balance.assert_not_awaited()
+    setup["trading_repo"].create_transaction.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -204,6 +206,7 @@ async def test_execute_buy_rejects_currency_mismatch(trading_setup):
         )
 
     setup["wallet_repo"].update_balance.assert_not_awaited()
+    setup["trading_repo"].create_transaction.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -458,3 +461,129 @@ def test_calculate_total_high_precision_decimals():
         Decimal("45000.50000000"),
     )
     assert total == Decimal("225.00250000000000")
+
+
+@pytest.mark.asyncio
+async def test_validate_buy_preconditions_rejects_currency_mismatch(trading_setup):
+    """Verify validate_buy_preconditions raises CurrencyMismatchError on differing currencies."""
+    setup = trading_setup
+    setup["asset"].currency = "EUR"
+
+    with pytest.raises(CurrencyMismatchError) as exc_info:
+        await setup["service"].validate_buy_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+    assert exc_info.value.wallet_currency == "USD"
+    assert exc_info.value.asset_currency == "EUR"
+    setup["wallet_repo"].update_balance.assert_not_awaited()
+    setup["trading_repo"].create_transaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_resolves_wallet_strictly_by_authenticated_user_id(
+    trading_setup,
+):
+    """Verify execute_buy queries the wallet repository strictly using authenticated user_id."""
+    setup = trading_setup
+
+    transaction = await setup["service"].execute_buy(
+        setup["user_id"],
+        setup["asset_id"],
+        Decimal("1.00000000"),
+        Decimal("100.00000000"),
+        setup["session"],
+    )
+
+    setup["wallet_repo"].get_wallet_for_user_update.assert_awaited_once_with(
+        setup["user_id"],
+        setup["session"],
+    )
+    assert transaction.wallet_id == setup["wallet"].id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "qty,prc",
+    [
+        (Decimal("NaN"), Decimal("100")),
+        (Decimal("10"), Decimal("Infinity")),
+        (Decimal("10"), Decimal("-Infinity")),
+        (Decimal("1.123456789"), Decimal("100")),
+        (Decimal("10"), Decimal("100.123456789")),
+        (Decimal("10000000000000000"), Decimal("100")),
+        (Decimal("10"), Decimal("10000000000000000")),
+    ],
+)
+async def test_validate_buy_preconditions_rejects_invalid_monetary_inputs(
+    trading_setup, qty, prc
+):
+    """Verify validate_buy_preconditions rejects non-finite and over-precision Decimal values."""
+    setup = trading_setup
+
+    with pytest.raises(InvalidTradeAmountError):
+        await setup["service"].validate_buy_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            qty,
+            prc,
+            setup["session"],
+        )
+
+    setup["wallet_repo"].get_wallet_for_user_update.assert_not_awaited()
+    setup["wallet_repo"].update_balance.assert_not_awaited()
+    setup["trading_repo"].create_transaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_succeeds_with_exact_balance_depletion(trading_setup):
+    """Verify execute_buy cleanly executes and depletes balance to zero when funds match exactly."""
+    setup = trading_setup
+    setup["wallet"].balance = Decimal("250.00000000")
+
+    transaction = await setup["service"].execute_buy(
+        setup["user_id"],
+        setup["asset_id"],
+        Decimal("2.50000000"),
+        Decimal("100.00000000"),
+        setup["session"],
+    )
+
+    assert isinstance(transaction, Transaction)
+    assert transaction.transaction_type == "BUY"
+    assert transaction.quantity == Decimal("2.50000000")
+    assert transaction.price == Decimal("100.00000000")
+    assert transaction.total_amount == Decimal("250.0000000000000000")
+
+    setup["wallet_repo"].update_balance.assert_awaited_once_with(
+        setup["wallet"],
+        Decimal("0.0000000000000000"),
+    )
+    setup["trading_repo"].create_transaction.assert_awaited_once_with(
+        transaction,
+        setup["session"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_rejects_invalid_monetary_inputs_without_side_effects(
+    trading_setup,
+):
+    """Verify execute_buy raises InvalidTradeAmountError and avoids any database mutation."""
+    setup = trading_setup
+
+    with pytest.raises(InvalidTradeAmountError):
+        await setup["service"].execute_buy(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("NaN"),
+            Decimal("100"),
+            setup["session"],
+        )
+
+    setup["wallet_repo"].update_balance.assert_not_awaited()
+    setup["trading_repo"].create_transaction.assert_not_awaited()
