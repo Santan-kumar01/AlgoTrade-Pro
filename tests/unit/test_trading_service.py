@@ -14,6 +14,7 @@ from src.core.exceptions import (
     WalletNotFoundError,
 )
 from src.models import Asset, Transaction
+from src.repositories.trading_repository import TradingRepository
 from src.services.trading_service import TradingService
 
 
@@ -716,3 +717,148 @@ async def test_execute_buy_rejects_non_positive_amount_without_wallet_mutation(
 
     setup["wallet_repo"].update_balance.assert_not_awaited()
     setup["trading_repo"].create_transaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_creates_single_transaction_with_all_expected_fields(
+    trading_setup,
+):
+    """Verify execute_buy creates exactly one immutable transaction with all required fields."""
+    setup = trading_setup
+
+    transaction = await setup["service"].execute_buy(
+        setup["user_id"],
+        setup["asset_id"],
+        Decimal("1.50000000"),
+        Decimal("250.00000000"),
+        setup["session"],
+    )
+
+    assert isinstance(transaction, Transaction)
+    assert transaction.wallet_id == setup["wallet"].id
+    assert transaction.asset_id == setup["asset"].id
+    assert transaction.transaction_type == "BUY"
+    assert isinstance(transaction.quantity, Decimal)
+    assert transaction.quantity == Decimal("1.50000000")
+    assert isinstance(transaction.price, Decimal)
+    assert transaction.price == Decimal("250.00000000")
+    assert isinstance(transaction.total_amount, Decimal)
+    assert transaction.total_amount == Decimal("375.0000000000000000")
+
+    setup["trading_repo"].create_transaction.assert_awaited_once_with(
+        transaction,
+        setup["session"],
+    )
+    setup["session"].flush.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_repeated_calls_create_separate_immutable_transactions(
+    trading_setup,
+):
+    """Verify repeated buy calls create distinct transaction instances without modifying prior ones."""
+    setup = trading_setup
+
+    tx1 = await setup["service"].execute_buy(
+        setup["user_id"],
+        setup["asset_id"],
+        Decimal("1.00000000"),
+        Decimal("100.00000000"),
+        setup["session"],
+    )
+
+    tx2 = await setup["service"].execute_buy(
+        setup["user_id"],
+        setup["asset_id"],
+        Decimal("2.00000000"),
+        Decimal("150.00000000"),
+        setup["session"],
+    )
+
+    assert tx1 is not tx2
+    assert tx1.quantity == Decimal("1.00000000")
+    assert tx1.price == Decimal("100.00000000")
+    assert tx1.total_amount == Decimal("100.0000000000000000")
+
+    assert tx2.quantity == Decimal("2.00000000")
+    assert tx2.price == Decimal("150.00000000")
+    assert tx2.total_amount == Decimal("300.0000000000000000")
+
+    assert setup["trading_repo"].create_transaction.await_count == 2
+    assert setup["trading_repo"].create_transaction.await_args_list[0].args[0] is tx1
+    assert setup["trading_repo"].create_transaction.await_args_list[1].args[0] is tx2
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_transaction_persistence_failure_yields_no_successful_response(
+    trading_setup,
+):
+    """Verify transaction persistence failure prevents returning a transaction response."""
+    setup = trading_setup
+    setup["trading_repo"].create_transaction.side_effect = RuntimeError(
+        "Database persistence error"
+    )
+
+    with pytest.raises(RuntimeError, match="Database persistence error"):
+        await setup["service"].execute_buy(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+    setup["session"].flush.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_session_flush_failure_yields_no_successful_response(
+    trading_setup,
+):
+    """Verify database flush failure propagates and yields no transaction response."""
+    setup = trading_setup
+    setup["session"].flush.side_effect = RuntimeError(
+        "Database flush constraint error"
+    )
+
+    with pytest.raises(RuntimeError, match="Database flush constraint error"):
+        await setup["service"].execute_buy(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+
+def test_trading_repository_exposes_no_transaction_mutation_methods():
+    """Verify the repository API contract does not expose update or delete methods for transactions."""
+    repository = TradingRepository()
+    assert not hasattr(repository, "update_transaction")
+    assert not hasattr(repository, "delete_transaction")
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_failure_triggers_transaction_context_exit_with_exception(
+    trading_setup,
+):
+    """Verify that an execution failure triggers transaction context exit with the exception for rollback."""
+    setup = trading_setup
+    context_mock = AsyncMock()
+    context_mock.__aenter__.return_value = context_mock
+    context_mock.__aexit__.return_value = False
+    setup["session"].begin.return_value = context_mock
+    setup["wallet"].balance = Decimal("10.00000000")
+
+    with pytest.raises(InsufficientFundsError):
+        await setup["service"].execute_buy(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+    context_mock.__aexit__.assert_awaited_once()
+    exc_type = context_mock.__aexit__.await_args.args[0]
+    assert exc_type is InsufficientFundsError
