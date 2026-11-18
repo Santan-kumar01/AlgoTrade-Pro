@@ -21,6 +21,20 @@ class TradingRepository:
         result = await session.execute(statement)
         return result.scalar_one_or_none()
 
+    async def get_assets_by_ids(
+        self,
+        asset_ids: set[UUID],
+        session: AsyncSession,
+    ) -> list[Asset]:
+        """Retrieve multiple assets in a single database query."""
+
+        if not asset_ids:
+            return []
+
+        statement = select(Asset).where(Asset.id.in_(asset_ids))
+        result = await session.execute(statement)
+        return list(result.scalars().all())
+
     async def get_asset_by_symbol(
         self,
         symbol: str,
@@ -86,3 +100,22 @@ class TradingRepository:
 
         session.add(transaction)
         return transaction
+
+    async def get_transactions_for_wallet(
+        self,
+        wallet_id: UUID,
+        session: AsyncSession,
+    ) -> list[Transaction]:
+        """Retrieve wallet transactions in chronological order."""
+
+        statement = (
+            select(Transaction)
+            .where(Transaction.wallet_id == wallet_id)
+            .order_by(
+                Transaction.created_at.asc(),
+                Transaction.id.asc(),
+            )
+        )
+
+        result = await session.execute(statement)
+        return list(result.scalars().all())
