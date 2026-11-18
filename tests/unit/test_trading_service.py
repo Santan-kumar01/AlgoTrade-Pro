@@ -587,3 +587,132 @@ async def test_execute_buy_rejects_invalid_monetary_inputs_without_side_effects(
 
     setup["wallet_repo"].update_balance.assert_not_awaited()
     setup["trading_repo"].create_transaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_deducts_exact_balance_with_fractional_price(
+    trading_setup,
+):
+    """Verify execute_buy calculates fractional price and deducts exact Decimal total."""
+    setup = trading_setup
+    setup["wallet"].balance = Decimal("1500.50000000")
+
+    transaction = await setup["service"].execute_buy(
+        setup["user_id"],
+        setup["asset_id"],
+        Decimal("3.25000000"),
+        Decimal("42.12500000"),
+        setup["session"],
+    )
+
+    assert isinstance(transaction, Transaction)
+    assert transaction.transaction_type == "BUY"
+    assert transaction.quantity == Decimal("3.25000000")
+    assert transaction.price == Decimal("42.12500000")
+    assert transaction.total_amount == Decimal("136.90625000000000")
+
+    setup["wallet_repo"].update_balance.assert_awaited_once_with(
+        setup["wallet"],
+        Decimal("1363.59375000000000"),
+    )
+    setup["trading_repo"].create_transaction.assert_awaited_once_with(
+        transaction,
+        setup["session"],
+    )
+    setup["session"].flush.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_propagates_wallet_repository_update_error(
+    trading_setup,
+):
+    """Verify repository exceptions during update_balance propagate and halt transaction staging."""
+    setup = trading_setup
+    setup["wallet_repo"].update_balance.side_effect = RuntimeError(
+        "Database error updating wallet balance"
+    )
+
+    with pytest.raises(
+        RuntimeError, match="Database error updating wallet balance"
+    ):
+        await setup["service"].execute_buy(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+    setup["trading_repo"].create_transaction.assert_not_awaited()
+    setup["session"].flush.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_aborts_flush_when_transaction_creation_fails(
+    trading_setup,
+):
+    """Verify failure in create_transaction propagates and halts session flush."""
+    setup = trading_setup
+    setup["trading_repo"].create_transaction.side_effect = RuntimeError(
+        "Ledger insertion failed"
+    )
+
+    with pytest.raises(RuntimeError, match="Ledger insertion failed"):
+        await setup["service"].execute_buy(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+    setup["wallet_repo"].update_balance.assert_awaited_once()
+    setup["session"].flush.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_propagates_session_flush_error(trading_setup):
+    """Verify failure during session flush propagates without being swallowed."""
+    setup = trading_setup
+    setup["session"].flush.side_effect = RuntimeError("Session flush failed")
+
+    with pytest.raises(RuntimeError, match="Session flush failed"):
+        await setup["service"].execute_buy(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+    setup["wallet_repo"].update_balance.assert_awaited_once()
+    setup["trading_repo"].create_transaction.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "qty,prc",
+    [
+        (Decimal("0"), Decimal("100")),
+        (Decimal("-1"), Decimal("100")),
+        (Decimal("10"), Decimal("0")),
+        (Decimal("10"), Decimal("-50")),
+    ],
+)
+async def test_execute_buy_rejects_non_positive_amount_without_wallet_mutation(
+    trading_setup, qty, prc
+):
+    """Verify execute_buy rejects non-positive amounts without mutating wallet or creating transaction."""
+    setup = trading_setup
+
+    with pytest.raises(InvalidTradeAmountError):
+        await setup["service"].execute_buy(
+            setup["user_id"],
+            setup["asset_id"],
+            qty,
+            prc,
+            setup["session"],
+        )
+
+    setup["wallet_repo"].update_balance.assert_not_awaited()
+    setup["trading_repo"].create_transaction.assert_not_awaited()
