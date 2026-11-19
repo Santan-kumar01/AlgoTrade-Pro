@@ -1,4 +1,3 @@
-
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -10,6 +9,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
 
     database_url: str
+    test_database_url: str | None = None
 
     secret_key: SecretStr
     access_token_expire_minutes: int = 30
