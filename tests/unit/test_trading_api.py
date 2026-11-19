@@ -15,6 +15,7 @@ from src.core.exceptions import (
     CurrencyMismatchError,
     InsufficientFundsError,
     InvalidTradeAmountError,
+    TradingEngineException,
     WalletNotFoundError,
 )
 from src.main import app
@@ -215,6 +216,52 @@ async def test_buy_order_ignores_client_supplied_wallet_id(api_setup):
 
 
 @pytest.mark.asyncio
+async def test_buy_order_ignores_client_supplied_user_id(api_setup):
+    """Verify client-supplied user_id in payload is ignored and authenticated user is used."""
+    setup = api_setup
+    untrusted_user_id = uuid4()
+    now = datetime.now(timezone.utc)
+
+    mock_transaction = Transaction(
+        id=uuid4(),
+        wallet_id=setup["wallet_id"],
+        asset_id=setup["asset_id"],
+        transaction_type="BUY",
+        quantity=Decimal("1.00000000"),
+        price=Decimal("50.00000000"),
+        total_amount=Decimal("50.00000000"),
+        created_at=now,
+    )
+    setup["mock_service"].execute_buy.return_value = mock_transaction
+
+    payload = {
+        "asset_id": str(setup["asset_id"]),
+        "quantity": "1.00000000",
+        "price": "50.00000000",
+        "user_id": str(untrusted_user_id),
+    }
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/v1/trades/buy",
+            json=payload,
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+
+    assert response.status_code == 201
+    setup["mock_service"].execute_buy.assert_awaited_once_with(
+        user_id=setup["user_id"],
+        asset_id=setup["asset_id"],
+        quantity=Decimal("1.00000000"),
+        price=Decimal("50.00000000"),
+        session=setup["mock_db"],
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "payload",
     [
@@ -280,6 +327,14 @@ async def test_buy_order_rejects_schema_validation_errors(api_setup, payload):
             400,
             "Quantity cannot exceed decimal limit.",
         ),
+        (
+            TradingEngineException(
+                "A generic trading engine failure.",
+                "GENERIC_TRADING_ERROR",
+            ),
+            400,
+            "A generic trading engine failure.",
+        ),
     ],
 )
 async def test_buy_order_maps_domain_exceptions_to_http_errors(
@@ -307,6 +362,31 @@ async def test_buy_order_maps_domain_exceptions_to_http_errors(
 
     assert response.status_code == expected_status
     assert response.json()["detail"] == expected_detail
+
+
+@pytest.mark.asyncio
+async def test_buy_order_unexpected_service_exception_returns_500(api_setup):
+    """Verify unhandled service exceptions result in HTTP 500 Internal Server Error."""
+    setup = api_setup
+    setup["mock_service"].execute_buy.side_effect = RuntimeError("Database connection pool exhausted")
+
+    payload = {
+        "asset_id": str(setup["asset_id"]),
+        "quantity": "1.00000000",
+        "price": "100.00000000",
+    }
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/v1/trades/buy",
+            json=payload,
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+
+    assert response.status_code == 500
 
 
 def test_buy_route_is_registered():
