@@ -1,4 +1,4 @@
-﻿from decimal import Decimal, localcontext
+from decimal import Decimal, localcontext
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,7 +12,7 @@ from src.core.exceptions import (
     InvalidTradeAmountError,
     WalletNotFoundError,
 )
-from src.models import Transaction
+from src.models import Asset, Transaction, Wallet
 from src.repositories.trading_repository import TradingRepository
 from src.repositories.wallet_repository import WalletRepository
 
@@ -146,16 +146,27 @@ class TradingService:
 
         return asset
 
-    async def execute_buy(
+    async def validate_buy_preconditions(
         self,
         user_id: UUID,
         asset_id: UUID,
         quantity: Decimal,
         price: Decimal,
         session: AsyncSession,
-    ) -> Transaction:
-        """Deduct wallet funds and insert a BUY ledger record atomically."""
+    ) -> tuple[Wallet, Asset, Decimal]:
+        """Validate all business preconditions for a simulated BUY order.
 
+        Verifies:
+        1. Input amounts: Quantity and price are positive, finite Decimals within precision limits.
+        2. Total cost: Calculated via exact Decimal arithmetic (quantity * price).
+        3. Wallet validation: Resolves the authenticated user's wallet (raising WalletNotFoundError if missing).
+        4. Asset validation: Resolves the target asset, verifying it exists, is active (raising AssetNotFoundError
+           or AssetInactiveError), and matches the wallet's currency (raising CurrencyMismatchError).
+        5. Balance validation: Verifies wallet.balance >= total_cost (raising InsufficientFundsError if balance < total_cost).
+
+        Returns:
+            tuple[Wallet, Asset, Decimal]: The locked wallet, tradable asset, and total cost.
+        """
         self._validate_amount(quantity, 16, "Quantity")
         self._validate_amount(price, 16, "Price")
 
@@ -166,26 +177,40 @@ class TradingService:
 
         total_cost = self._calculate_total(quantity, price)
 
+        wallet = await self._get_locked_wallet(user_id, session)
+        asset = await self._get_tradable_asset(asset_id, wallet, session)
+
+        self._validate_amount(
+            wallet.balance,
+            self.WALLET_MAX_INTEGER_DIGITS,
+            "Wallet balance",
+        )
+
+        if wallet.balance < total_cost:
+            raise InsufficientFundsError(
+                available=wallet.balance,
+                required=total_cost,
+            )
+
+        return wallet, asset, total_cost
+
+    async def execute_buy(
+        self,
+        user_id: UUID,
+        asset_id: UUID,
+        quantity: Decimal,
+        price: Decimal,
+        session: AsyncSession,
+    ) -> Transaction:
+        """Deduct wallet funds and insert a BUY ledger record atomically."""
         async with session.begin():
-            wallet = await self._get_locked_wallet(user_id, session)
-
-            asset = await self._get_tradable_asset(
-                asset_id,
-                wallet,
-                session,
+            wallet, asset, total_cost = await self.validate_buy_preconditions(
+                user_id=user_id,
+                asset_id=asset_id,
+                quantity=quantity,
+                price=price,
+                session=session,
             )
-
-            self._validate_amount(
-                wallet.balance,
-                self.WALLET_MAX_INTEGER_DIGITS,
-                "Wallet balance",
-            )
-
-            if wallet.balance < total_cost:
-                raise InsufficientFundsError(
-                    available=wallet.balance,
-                    required=total_cost,
-                )
 
             with localcontext() as context:
                 context.prec = 60
