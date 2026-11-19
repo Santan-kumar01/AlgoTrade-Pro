@@ -1,4 +1,4 @@
-﻿from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator
 from decimal import Decimal
 from uuid import uuid4
 
@@ -21,8 +21,14 @@ TEST_DATABASE_NAME = "algotrade_pro_test"
 @pytest.fixture
 async def db_engine():
     """Create an engine restricted to the dedicated test database."""
+    if not settings.test_database_url:
+        raise RuntimeError(
+            "TEST_DATABASE_URL must be configured before running "
+            "integration tests."
+        )
+
     engine = create_async_engine(
-        settings.database_url,
+        settings.test_database_url,
         poolclass=NullPool,
     )
 
