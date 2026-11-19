@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 
 from src.api.auth import router as auth_router
+from src.api.trading import router as trading_router
 from src.api.wallet import router as wallet_router
 from src.core.config import settings
 
@@ -13,6 +14,7 @@ app = FastAPI(
 
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(wallet_router, prefix="/api/v1")
+app.include_router(trading_router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["Health"])
