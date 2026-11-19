@@ -9,8 +9,14 @@ from src.core.config import settings
 @pytest.fixture
 async def db_engine():
     """Create an isolated engine for the dedicated test database."""
+    if not settings.test_database_url:
+        raise RuntimeError(
+            "TEST_DATABASE_URL must be configured before running "
+            "integration tests."
+        )
+
     test_engine = create_async_engine(
-        settings.database_url,
+        settings.test_database_url,
         poolclass=NullPool,
     )
 
