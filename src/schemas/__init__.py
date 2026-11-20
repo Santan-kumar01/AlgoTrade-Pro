@@ -1,10 +1,15 @@
-﻿from src.schemas.auth import (
+from src.schemas.auth import (
     TokenResponse,
     UserLogin,
     UserRegister,
     UserResponse,
 )
 from src.schemas.portfolio import (
+    CurrencyAnalyticsResponse,
+    MarketPriceInput,
+    PortfolioAnalyticsRequest,
+    PortfolioAnalyticsResponse,
+    PortfolioPositionAnalyticsResponse,
     PortfolioPositionResponse,
     PortfolioSummaryResponse,
 )
@@ -18,6 +23,11 @@ from src.schemas.wallet import WalletResponse
 
 __all__ = [
     "BuyOrderRequest",
+    "CurrencyAnalyticsResponse",
+    "MarketPriceInput",
+    "PortfolioAnalyticsRequest",
+    "PortfolioAnalyticsResponse",
+    "PortfolioPositionAnalyticsResponse",
     "PortfolioPositionResponse",
     "PortfolioSummaryResponse",
     "SellOrderRequest",
