@@ -862,3 +862,354 @@ async def test_execute_buy_failure_triggers_transaction_context_exit_with_except
     context_mock.__aexit__.assert_awaited_once()
     exc_type = context_mock.__aexit__.await_args.args[0]
     assert exc_type is InsufficientFundsError
+
+
+@pytest.mark.asyncio
+async def test_validate_sell_preconditions_success(trading_setup):
+    """Verify validate_sell_preconditions passes with valid active asset, wallet, and sufficient holdings."""
+    setup = trading_setup
+
+    wallet, asset, total_proceeds = (
+        await setup["service"].validate_sell_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("2.00000000"),
+            Decimal("150.00000000"),
+            setup["session"],
+        )
+    )
+
+    assert wallet is setup["wallet"]
+    assert asset is setup["asset"]
+    assert total_proceeds == Decimal("300.0000000000000000")
+    setup["wallet_repo"].get_wallet_for_user_update.assert_awaited_once_with(
+        setup["user_id"],
+        setup["session"],
+    )
+    setup["trading_repo"].get_asset_by_id.assert_awaited_once_with(
+        setup["asset_id"],
+        setup["session"],
+    )
+    setup["trading_repo"].get_net_holdings.assert_awaited_once_with(
+        setup["wallet"].id,
+        setup["asset_id"],
+        setup["session"],
+    )
+    setup["wallet_repo"].update_balance.assert_not_awaited()
+    setup["trading_repo"].create_transaction.assert_not_awaited()
+    setup["session"].flush.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_validate_sell_preconditions_exact_holdings_boundary(trading_setup):
+    """Verify validate_sell_preconditions succeeds when available holdings exactly match sell quantity."""
+    setup = trading_setup
+    setup["trading_repo"].get_net_holdings.return_value = Decimal("5.00000000")
+
+    wallet, asset, total_proceeds = (
+        await setup["service"].validate_sell_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("5.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+    )
+
+    assert total_proceeds == Decimal("500.0000000000000000")
+    assert wallet is setup["wallet"]
+    assert asset is setup["asset"]
+
+
+@pytest.mark.asyncio
+async def test_validate_sell_preconditions_rejects_insufficient_holdings(trading_setup):
+    """Verify validate_sell_preconditions raises InsufficientHoldingsError when holdings < quantity."""
+    setup = trading_setup
+    setup["trading_repo"].get_net_holdings.return_value = Decimal("4.99999999")
+
+    with pytest.raises(InsufficientHoldingsError) as exc_info:
+        await setup["service"].validate_sell_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("5.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+    assert exc_info.value.available == Decimal("4.99999999")
+    assert exc_info.value.requested == Decimal("5.00000000")
+    setup["wallet_repo"].update_balance.assert_not_awaited()
+    setup["trading_repo"].create_transaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_validate_sell_preconditions_rejects_zero_holdings(trading_setup):
+    """Verify validate_sell_preconditions raises InsufficientHoldingsError when user owns zero holdings."""
+    setup = trading_setup
+    setup["trading_repo"].get_net_holdings.return_value = Decimal("0.00000000")
+
+    with pytest.raises(InsufficientHoldingsError) as exc_info:
+        await setup["service"].validate_sell_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+    assert exc_info.value.available == Decimal("0.00000000")
+    assert exc_info.value.requested == Decimal("1.00000000")
+    setup["wallet_repo"].update_balance.assert_not_awaited()
+    setup["trading_repo"].create_transaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_validate_sell_preconditions_rejects_missing_asset(trading_setup):
+    """Verify validate_sell_preconditions raises AssetNotFoundError for missing asset."""
+    setup = trading_setup
+    setup["trading_repo"].get_asset_by_id.return_value = None
+
+    with pytest.raises(AssetNotFoundError) as exc_info:
+        await setup["service"].validate_sell_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+    assert exc_info.value.asset_id == setup["asset_id"]
+    setup["trading_repo"].get_net_holdings.assert_not_awaited()
+    setup["wallet_repo"].update_balance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_validate_sell_preconditions_rejects_inactive_asset(trading_setup):
+    """Verify validate_sell_preconditions raises AssetInactiveError for inactive asset."""
+    setup = trading_setup
+    setup["asset"].is_active = False
+
+    with pytest.raises(AssetInactiveError) as exc_info:
+        await setup["service"].validate_sell_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+    assert exc_info.value.symbol == setup["asset"].symbol
+    setup["trading_repo"].get_net_holdings.assert_not_awaited()
+    setup["wallet_repo"].update_balance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_validate_sell_preconditions_rejects_missing_wallet(trading_setup):
+    """Verify validate_sell_preconditions raises WalletNotFoundError when user wallet is missing."""
+    setup = trading_setup
+    setup["wallet_repo"].get_wallet_for_user_update.return_value = None
+
+    with pytest.raises(WalletNotFoundError) as exc_info:
+        await setup["service"].validate_sell_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+    assert exc_info.value.user_id == setup["user_id"]
+    setup["trading_repo"].get_asset_by_id.assert_not_awaited()
+    setup["trading_repo"].get_net_holdings.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_validate_sell_preconditions_rejects_currency_mismatch(trading_setup):
+    """Verify validate_sell_preconditions raises CurrencyMismatchError on differing currencies."""
+    setup = trading_setup
+    setup["asset"].currency = "EUR"
+
+    with pytest.raises(CurrencyMismatchError) as exc_info:
+        await setup["service"].validate_sell_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+    assert exc_info.value.wallet_currency == "USD"
+    assert exc_info.value.asset_currency == "EUR"
+    setup["trading_repo"].get_net_holdings.assert_not_awaited()
+    setup["wallet_repo"].update_balance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "qty,prc",
+    [
+        (Decimal("0"), Decimal("100")),
+        (Decimal("-1"), Decimal("100")),
+        (Decimal("10"), Decimal("0")),
+        (Decimal("10"), Decimal("-50")),
+    ],
+)
+async def test_validate_sell_preconditions_rejects_non_positive_amounts(
+    trading_setup, qty, prc
+):
+    """Verify validate_sell_preconditions rejects zero or negative quantity and price."""
+    setup = trading_setup
+
+    with pytest.raises(InvalidTradeAmountError):
+        await setup["service"].validate_sell_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            qty,
+            prc,
+            setup["session"],
+        )
+
+    setup["wallet_repo"].get_wallet_for_user_update.assert_not_awaited()
+    setup["trading_repo"].get_asset_by_id.assert_not_awaited()
+    setup["trading_repo"].get_net_holdings.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "qty,prc",
+    [
+        (Decimal("NaN"), Decimal("100")),
+        (Decimal("10"), Decimal("Infinity")),
+        (Decimal("10"), Decimal("-Infinity")),
+        (Decimal("1.123456789"), Decimal("100")),
+        (Decimal("10"), Decimal("100.123456789")),
+        (Decimal("10000000000000000"), Decimal("100")),
+        (Decimal("10"), Decimal("10000000000000000")),
+    ],
+)
+async def test_validate_sell_preconditions_rejects_invalid_monetary_inputs(
+    trading_setup, qty, prc
+):
+    """Verify validate_sell_preconditions rejects non-finite and over-precision Decimal values."""
+    setup = trading_setup
+
+    with pytest.raises(InvalidTradeAmountError):
+        await setup["service"].validate_sell_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            qty,
+            prc,
+            setup["session"],
+        )
+
+    setup["wallet_repo"].get_wallet_for_user_update.assert_not_awaited()
+    setup["trading_repo"].get_asset_by_id.assert_not_awaited()
+    setup["trading_repo"].get_net_holdings.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_validate_sell_preconditions_propagates_wallet_repository_error(
+    trading_setup,
+):
+    """Verify repository exceptions during wallet lookup propagate without being swallowed."""
+    setup = trading_setup
+    setup["wallet_repo"].get_wallet_for_user_update.side_effect = RuntimeError(
+        "Database connection error"
+    )
+
+    with pytest.raises(RuntimeError, match="Database connection error"):
+        await setup["service"].validate_sell_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_validate_sell_preconditions_propagates_asset_repository_error(
+    trading_setup,
+):
+    """Verify repository exceptions during asset lookup propagate without being swallowed."""
+    setup = trading_setup
+    setup["trading_repo"].get_asset_by_id.side_effect = RuntimeError(
+        "Asset table lock timeout"
+    )
+
+    with pytest.raises(RuntimeError, match="Asset table lock timeout"):
+        await setup["service"].validate_sell_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_validate_sell_preconditions_propagates_holdings_repository_error(
+    trading_setup,
+):
+    """Verify repository exceptions during net holdings query propagate without being swallowed."""
+    setup = trading_setup
+    setup["trading_repo"].get_net_holdings.side_effect = RuntimeError(
+        "Ledger aggregation query failed"
+    )
+
+    with pytest.raises(RuntimeError, match="Ledger aggregation query failed"):
+        await setup["service"].validate_sell_preconditions(
+            setup["user_id"],
+            setup["asset_id"],
+            Decimal("1.00000000"),
+            Decimal("100.00000000"),
+            setup["session"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_validate_sell_preconditions_performs_no_side_effects(
+    trading_setup,
+):
+    """Verify validate_sell_preconditions causes no database mutations or wallet state changes."""
+    setup = trading_setup
+    initial_balance = setup["wallet"].balance
+
+    await setup["service"].validate_sell_preconditions(
+        setup["user_id"],
+        setup["asset_id"],
+        Decimal("2.00000000"),
+        Decimal("100.00000000"),
+        setup["session"],
+    )
+
+    assert setup["wallet"].balance == initial_balance
+    setup["wallet_repo"].update_balance.assert_not_awaited()
+    setup["trading_repo"].create_transaction.assert_not_awaited()
+    setup["session"].flush.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_validate_sell_preconditions_enforces_user_id_isolation(
+    trading_setup,
+):
+    """Verify validate_sell_preconditions queries wallet and holdings strictly by authenticated user."""
+    setup = trading_setup
+
+    await setup["service"].validate_sell_preconditions(
+        setup["user_id"],
+        setup["asset_id"],
+        Decimal("1.00000000"),
+        Decimal("100.00000000"),
+        setup["session"],
+    )
+
+    setup["wallet_repo"].get_wallet_for_user_update.assert_awaited_once_with(
+        setup["user_id"],
+        setup["session"],
+    )
+    setup["trading_repo"].get_net_holdings.assert_awaited_once_with(
+        setup["wallet"].id,
+        setup["asset_id"],
+        setup["session"],
+    )
