@@ -366,4 +366,4 @@ async def test_analytics_rejects_non_dictionary_market_prices():
     ):
         await service.get_analytics(wallet_id, [], AsyncMock())
 
-    portfolio_service.get_portfolio.assert_not_awaited()
+    portfolio_service.get_portfolio.assert_not_awaited() 
