@@ -19,7 +19,7 @@ from src.schemas.trading import (
     TradeResponse,
     TradeType,
 )
-from src.schemas.wallet import WalletResponse
+from src.schemas.wallet import WalletResponse 
 
 __all__ = [
     "BuyOrderRequest",
