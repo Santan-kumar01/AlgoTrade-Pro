@@ -29,7 +29,7 @@ def test_database_dependency_is_async_generator():
 
 
 def test_declarative_base_metadata():
-    from src.models import Asset, Transaction, User, Wallet
+    from src.models import Asset, PortfolioSnapshot, Transaction, User, Wallet
 
     assert Base.metadata is not None
     assert set(Base.metadata.tables.keys()) == {
@@ -37,11 +37,13 @@ def test_declarative_base_metadata():
         "assets",
         "wallets",
         "transactions",
+        "portfolio_snapshots",
     }
     assert User.__table__ in Base.metadata.tables.values()
     assert Asset.__table__ in Base.metadata.tables.values()
     assert Wallet.__table__ in Base.metadata.tables.values()
     assert Transaction.__table__ in Base.metadata.tables.values()
+    assert PortfolioSnapshot.__table__ in Base.metadata.tables.values()
 
 
 @pytest.mark.asyncio
@@ -78,4 +80,5 @@ async def test_database_session_lifecycle(monkeypatch):
 @pytest.mark.asyncio
 async def test_database_engine_disposal():
     await close_db_connection()
+
 

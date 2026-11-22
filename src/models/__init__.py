@@ -1,5 +1,6 @@
 ﻿from src.models.asset import Asset
 from src.models.base import Base, TimestampMixin
+from src.models.portfolio_snapshot import PortfolioSnapshot
 from src.models.transaction import Transaction
 from src.models.user import User
 from src.models.wallet import Wallet
@@ -7,6 +8,7 @@ from src.models.wallet import Wallet
 __all__ = [
     "Asset",
     "Base",
+    "PortfolioSnapshot",
     "TimestampMixin",
     "Transaction",
     "User",
