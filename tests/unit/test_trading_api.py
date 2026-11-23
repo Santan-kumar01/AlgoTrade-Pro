@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from src.api.deps import get_current_user
+from src.api.deps import get_current_user_id
 from src.api.trading import get_trading_service
 from src.core.database import get_db
 from src.core.exceptions import (
@@ -47,14 +47,14 @@ def api_setup():
     async def override_get_db():
         yield mock_db
 
-    async def override_current_user():
-        return user
+    def override_current_user_id():
+        return user_id
 
     def override_trading_service():
         return mock_service
 
     app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_current_user] = override_current_user
+    app.dependency_overrides[get_current_user_id] = override_current_user_id
     app.dependency_overrides[get_trading_service] = override_trading_service
 
     try:
@@ -68,7 +68,7 @@ def api_setup():
         }
     finally:
         app.dependency_overrides.pop(get_db, None)
-        app.dependency_overrides.pop(get_current_user, None)
+        app.dependency_overrides.pop(get_current_user_id, None)
         app.dependency_overrides.pop(get_trading_service, None)
 
 

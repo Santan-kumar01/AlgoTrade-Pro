@@ -1,7 +1,9 @@
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import get_current_user
+from src.api.deps import get_current_user_id
 from src.core.database import get_db
 from src.core.exceptions import (
     AssetInactiveError,
@@ -13,7 +15,6 @@ from src.core.exceptions import (
     TradingEngineException,
     WalletNotFoundError,
 )
-from src.models import User
 from src.schemas import BuyOrderRequest, SellOrderRequest, TradeResponse
 from src.services.trading_service import TradingService
 
@@ -33,7 +34,7 @@ def get_trading_service() -> TradingService:
 )
 async def buy_order(
     order_data: BuyOrderRequest,
-    current_user: User = Depends(get_current_user),
+    current_user_id: UUID = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
     trading_service: TradingService = Depends(get_trading_service),
 ) -> TradeResponse:
@@ -41,7 +42,7 @@ async def buy_order(
 
     try:
         transaction = await trading_service.execute_buy(
-            user_id=current_user.id,
+            user_id=current_user_id,
             asset_id=order_data.asset_id,
             quantity=order_data.quantity,
             price=order_data.price,
@@ -75,7 +76,7 @@ async def buy_order(
 )
 async def sell_order(
     order_data: SellOrderRequest,
-    current_user: User = Depends(get_current_user),
+    current_user_id: UUID = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
     trading_service: TradingService = Depends(get_trading_service),
 ) -> TradeResponse:
@@ -83,7 +84,7 @@ async def sell_order(
 
     try:
         transaction = await trading_service.execute_sell(
-            user_id=current_user.id,
+            user_id=current_user_id,
             asset_id=order_data.asset_id,
             quantity=order_data.quantity,
             price=order_data.price,
