@@ -1,5 +1,6 @@
 import asyncio
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import select
@@ -576,3 +577,173 @@ async def test_concurrent_buy_and_sell_maintains_balance_and_ledger_integrity(
         assert tx_by_id[sell_tx.id].quantity == Decimal("3.00000000")
         assert tx_by_id[sell_tx.id].price == Decimal("150.00000000")
         assert tx_by_id[sell_tx.id].total_amount == Decimal("450.00000000")
+
+
+@pytest.mark.asyncio
+async def test_buy_rollback_on_ledger_failure_preserves_wallet_and_holdings(
+    db_session_factory,
+    trading_user,
+    trading_asset,
+):
+    """Verify BUY transaction rolls back wallet debit if ledger creation fails."""
+    user, wallet = trading_user
+    service = TradingService()
+    trading_repo = TradingRepository()
+
+    observed_balance_before_failure: Decimal | None = None
+
+    async def failing_create_transaction(transaction, session):
+        nonlocal observed_balance_before_failure
+        # Flush the wallet update to the database within the open transaction
+        await session.flush()
+        in_session_wallet = await session.get(Wallet, wallet.id)
+        if in_session_wallet is not None:
+            observed_balance_before_failure = in_session_wallet.balance
+        raise RuntimeError("Simulated ledger creation failure")
+
+    with patch.object(
+        service.trading_repo,
+        "create_transaction",
+        side_effect=failing_create_transaction,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="Simulated ledger creation failure",
+        ):
+            async with db_session_factory() as session:
+                await service.execute_buy(
+                    user_id=user.id,
+                    asset_id=trading_asset.id,
+                    quantity=Decimal("2.00000000"),
+                    price=Decimal("100.00000000"),
+                    session=session,
+                )
+
+    # Confirm the wallet update happened before the injected failure
+    assert observed_balance_before_failure == Decimal("9800.00000000")
+
+    # Verify using a fresh independent database session:
+    async with db_session_factory() as verification_session:
+        updated_wallet = await verification_session.get(
+            Wallet,
+            wallet.id,
+        )
+        assert updated_wallet is not None
+        assert updated_wallet.balance == Decimal("10000.00000000")
+
+        holdings = await trading_repo.get_net_holdings(
+            wallet.id,
+            trading_asset.id,
+            verification_session,
+        )
+        assert holdings == Decimal("0")
+
+        result = await verification_session.execute(
+            select(Transaction).where(
+                Transaction.wallet_id == wallet.id,
+                Transaction.asset_id == trading_asset.id,
+            )
+        )
+        transactions = list(result.scalars().all())
+        assert transactions == []
+
+
+@pytest.mark.asyncio
+async def test_sell_rollback_on_ledger_failure_preserves_wallet_and_holdings(
+    db_session_factory,
+    trading_user,
+    trading_asset,
+):
+    """Verify SELL transaction rolls back wallet credit if ledger creation fails."""
+    user, wallet = trading_user
+    service = TradingService()
+    trading_repo = TradingRepository()
+
+    # Step 1 & 2: Execute real setup BUY of 10 units at $100 ($1,000 cost)
+    async with db_session_factory() as setup_session:
+        setup_buy = await service.execute_buy(
+            user_id=user.id,
+            asset_id=trading_asset.id,
+            quantity=Decimal("10.00000000"),
+            price=Decimal("100.00000000"),
+            session=setup_session,
+        )
+        assert setup_buy is not None
+        assert setup_buy.quantity == Decimal("10.00000000")
+
+    # Step 3: Confirm baseline wallet balance is $9,000 and holdings are 10 units
+    async with db_session_factory() as baseline_session:
+        baseline_wallet = await baseline_session.get(Wallet, wallet.id)
+        assert baseline_wallet is not None
+        assert baseline_wallet.balance == Decimal("9000.00000000")
+        baseline_holdings = await trading_repo.get_net_holdings(
+            wallet.id,
+            trading_asset.id,
+            baseline_session,
+        )
+        assert baseline_holdings == Decimal("10.00000000")
+
+    # Step 4: Inject a controlled RuntimeError into trading_repo.create_transaction
+    observed_balance_before_failure: Decimal | None = None
+
+    async def failing_create_transaction(transaction, session):
+        nonlocal observed_balance_before_failure
+        # Flush the wallet update to the database within the open transaction
+        await session.flush()
+        in_session_wallet = await session.get(Wallet, wallet.id)
+        if in_session_wallet is not None:
+            observed_balance_before_failure = in_session_wallet.balance
+        raise RuntimeError("Simulated ledger creation failure")
+
+    with patch.object(
+        service.trading_repo,
+        "create_transaction",
+        side_effect=failing_create_transaction,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="Simulated ledger creation failure",
+        ):
+            async with db_session_factory() as session:
+                await service.execute_sell(
+                    user_id=user.id,
+                    asset_id=trading_asset.id,
+                    quantity=Decimal("4.00000000"),
+                    price=Decimal("120.00000000"),
+                    session=session,
+                )
+
+    # Step 6: Confirm the wallet update happened before the injected failure
+    # Baseline $9,000 + $480 proceeds = $9,480
+    assert observed_balance_before_failure == Decimal("9480.00000000")
+
+    # Step 8: Verify using a fresh independent database session:
+    async with db_session_factory() as verification_session:
+        updated_wallet = await verification_session.get(
+            Wallet,
+            wallet.id,
+        )
+        assert updated_wallet is not None
+        assert updated_wallet.balance == Decimal("9000.00000000")
+
+        holdings = await trading_repo.get_net_holdings(
+            wallet.id,
+            trading_asset.id,
+            verification_session,
+        )
+        assert holdings == Decimal("10.00000000")
+
+        result = await verification_session.execute(
+            select(Transaction)
+            .where(
+                Transaction.wallet_id == wallet.id,
+                Transaction.asset_id == trading_asset.id,
+            )
+        )
+        transactions = list(result.scalars().all())
+        assert len(transactions) == 1
+        assert transactions[0].id == setup_buy.id
+        assert transactions[0].transaction_type == "BUY"
+        assert transactions[0].quantity == Decimal("10.00000000")
+        assert transactions[0].price == Decimal("100.00000000")
+        assert transactions[0].total_amount == Decimal("1000.00000000")
