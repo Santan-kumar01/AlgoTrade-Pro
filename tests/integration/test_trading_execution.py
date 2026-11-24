@@ -400,3 +400,179 @@ async def test_concurrent_sells_prevent_negative_holdings(
         assert transactions[1].quantity == Decimal("8.00000000")
         assert transactions[1].price == Decimal("120.00000000")
         assert transactions[1].total_amount == Decimal("960.00000000")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_buy_and_sell_maintains_balance_and_ledger_integrity(
+    db_session_factory,
+    trading_user,
+    trading_asset,
+):
+    """Verify concurrent BUY and SELL maintain balance and ledger integrity."""
+    user, wallet = trading_user
+    service = TradingService()
+    trading_repo = TradingRepository()
+
+    # Step 1: Establish initial holdings of 5 units via setup BUY execution
+    async with db_session_factory() as setup_session:
+        setup_buy = await service.execute_buy(
+            user_id=user.id,
+            asset_id=trading_asset.id,
+            quantity=Decimal("5.00000000"),
+            price=Decimal("100.00000000"),
+            session=setup_session,
+        )
+        assert setup_buy is not None
+        assert setup_buy.quantity == Decimal("5.00000000")
+
+    # Verify baseline database state after setup BUY ($10,000 - $500 = $9,500; 5 units)
+    async with db_session_factory() as baseline_session:
+        setup_wallet = await baseline_session.get(Wallet, wallet.id)
+        assert setup_wallet is not None
+        assert setup_wallet.balance == Decimal("9500.00000000")
+        setup_holdings = await trading_repo.get_net_holdings(
+            wallet.id,
+            trading_asset.id,
+            baseline_session,
+        )
+        assert setup_holdings == Decimal("5.00000000")
+
+    # Step 2: Python 3.10-compatible bounded synchronization across coroutines
+    ready_event = asyncio.Event()
+    counter_lock = asyncio.Lock()
+    ready_count = 0
+
+    async def synchronize():
+        nonlocal ready_count
+        async with counter_lock:
+            ready_count += 1
+            if ready_count == 2:
+                ready_event.set()
+        await asyncio.wait_for(ready_event.wait(), timeout=5.0)
+
+    async def execute_concurrent_buy():
+        async with db_session_factory() as session:
+            await synchronize()
+            return await service.execute_buy(
+                user_id=user.id,
+                asset_id=trading_asset.id,
+                quantity=Decimal("2.00000000"),
+                price=Decimal("100.00000000"),
+                session=session,
+            )
+
+    async def execute_concurrent_sell():
+        async with db_session_factory() as session:
+            await synchronize()
+            return await service.execute_sell(
+                user_id=user.id,
+                asset_id=trading_asset.id,
+                quantity=Decimal("3.00000000"),
+                price=Decimal("150.00000000"),
+                session=session,
+            )
+
+    # Step 3: Launch BUY and SELL operations simultaneously with bounded timeout
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            execute_concurrent_buy(),
+            execute_concurrent_sell(),
+            return_exceptions=True,
+        ),
+        timeout=10.0,
+    )
+
+    # Step 4: Verify both operations completed successfully without unexpected exceptions
+    assert len(results) == 2
+    for result in results:
+        assert isinstance(result, Transaction), (
+            f"Unexpected exception during concurrent BUY and SELL execution: {result}"
+        )
+
+    buy_trades = [
+        r
+        for r in results
+        if isinstance(r, Transaction) and r.transaction_type == "BUY"
+    ]
+    sell_trades = [
+        r
+        for r in results
+        if isinstance(r, Transaction) and r.transaction_type == "SELL"
+    ]
+
+    assert len(buy_trades) == 1, (
+        f"Expected exactly 1 BUY transaction, got {len(buy_trades)}"
+    )
+    assert len(sell_trades) == 1, (
+        f"Expected exactly 1 SELL transaction, got {len(sell_trades)}"
+    )
+
+    buy_tx = buy_trades[0]
+    sell_tx = sell_trades[0]
+
+    assert buy_tx.wallet_id == wallet.id
+    assert buy_tx.asset_id == trading_asset.id
+    assert buy_tx.quantity == Decimal("2.00000000")
+    assert buy_tx.price == Decimal("100.00000000")
+    assert buy_tx.total_amount == Decimal("200.00000000")
+
+    assert sell_tx.wallet_id == wallet.id
+    assert sell_tx.asset_id == trading_asset.id
+    assert sell_tx.quantity == Decimal("3.00000000")
+    assert sell_tx.price == Decimal("150.00000000")
+    assert sell_tx.total_amount == Decimal("450.00000000")
+
+    # Step 5: Verify final database state
+    async with db_session_factory() as verification_session:
+        updated_wallet = await verification_session.get(
+            Wallet,
+            wallet.id,
+        )
+
+        # Initial $10,000 - $500 (setup BUY) - $200 (concurrent BUY)
+        # + $450 (concurrent SELL) = $9,750
+        assert updated_wallet is not None
+        assert updated_wallet.balance == Decimal("9750.00000000")
+
+        # Final holdings: 5.0 (setup) + 2.0 (BUY) - 3.0 (SELL) = 4.0 units
+        final_holdings = await trading_repo.get_net_holdings(
+            wallet.id,
+            trading_asset.id,
+            verification_session,
+        )
+        assert final_holdings == Decimal("4.00000000")
+
+        # Ledger must contain exactly 3 transactions: setup BUY,
+        # concurrent BUY, and concurrent SELL
+        result = await verification_session.execute(
+            select(Transaction)
+            .where(
+                Transaction.wallet_id == wallet.id,
+                Transaction.asset_id == trading_asset.id,
+            )
+            .order_by(Transaction.created_at.asc(), Transaction.id.asc())
+        )
+        transactions = list(result.scalars().all())
+
+        assert len(transactions) == 3
+        assert {tx.id for tx in transactions} == {
+            setup_buy.id,
+            buy_tx.id,
+            sell_tx.id,
+        }
+
+        tx_by_id = {tx.id: tx for tx in transactions}
+        assert tx_by_id[setup_buy.id].transaction_type == "BUY"
+        assert tx_by_id[setup_buy.id].quantity == Decimal("5.00000000")
+        assert tx_by_id[setup_buy.id].price == Decimal("100.00000000")
+        assert tx_by_id[setup_buy.id].total_amount == Decimal("500.00000000")
+
+        assert tx_by_id[buy_tx.id].transaction_type == "BUY"
+        assert tx_by_id[buy_tx.id].quantity == Decimal("2.00000000")
+        assert tx_by_id[buy_tx.id].price == Decimal("100.00000000")
+        assert tx_by_id[buy_tx.id].total_amount == Decimal("200.00000000")
+
+        assert tx_by_id[sell_tx.id].transaction_type == "SELL"
+        assert tx_by_id[sell_tx.id].quantity == Decimal("3.00000000")
+        assert tx_by_id[sell_tx.id].price == Decimal("150.00000000")
+        assert tx_by_id[sell_tx.id].total_amount == Decimal("450.00000000")
