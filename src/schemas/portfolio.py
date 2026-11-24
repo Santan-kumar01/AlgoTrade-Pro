@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
@@ -107,3 +108,18 @@ class PortfolioAnalyticsResponse(BaseModel):
     wallet_id: UUID
     positions: tuple[PortfolioPositionAnalyticsResponse, ...]
     currencies: tuple[CurrencyAnalyticsResponse, ...]
+
+class PortfolioSnapshotResponse(BaseModel):
+    """Historical portfolio snapshot returned to the wallet owner."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    wallet_id: UUID
+    currency: str
+    snapshot_at: datetime
+    total_invested: Decimal
+    market_value: Decimal
+    realized_pnl: Decimal
+    unrealized_pnl: Decimal
+    total_pnl: Decimal

@@ -12,6 +12,7 @@ from src.schemas.portfolio import (
     PortfolioPositionAnalyticsResponse,
     PortfolioPositionResponse,
     PortfolioSummaryResponse,
+    PortfolioSnapshotResponse,
 )
 from src.schemas.trading import (
     BuyOrderRequest,
@@ -30,6 +31,7 @@ __all__ = [
     "PortfolioPositionAnalyticsResponse",
     "PortfolioPositionResponse",
     "PortfolioSummaryResponse",
+    "PortfolioSnapshotResponse",
     "SellOrderRequest",
     "TokenResponse",
     "TradeResponse",
