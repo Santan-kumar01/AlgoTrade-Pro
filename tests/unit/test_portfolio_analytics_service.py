@@ -367,3 +367,46 @@ async def test_analytics_rejects_non_dictionary_market_prices():
         await service.get_analytics(wallet_id, [], AsyncMock())
 
     portfolio_service.get_portfolio.assert_not_awaited() 
+
+
+@pytest.mark.asyncio
+async def test_analytics_calculates_negative_unrealized_pnl():
+    wallet_id = uuid4()
+    asset_id = uuid4()
+
+    portfolio_service = AsyncMock()
+    portfolio_service.get_portfolio.return_value = PortfolioSummary(
+        wallet_id=wallet_id,
+        positions=(
+            PortfolioPosition(
+                asset_id=asset_id,
+                symbol="BTC",
+                name="Bitcoin",
+                asset_type="CRYPTO",
+                currency="USD",
+                quantity=Decimal("2"),
+                average_cost=Decimal("150"),
+                total_invested=Decimal("300"),
+                realized_pnl=Decimal("10"),
+            ),
+        ),
+        realized_pnl_by_currency={"USD": Decimal("10")},
+    )
+
+    service = PortfolioAnalyticsService(portfolio_service)
+
+    result = await service.get_analytics(
+        wallet_id,
+        {asset_id: Decimal("100")},
+        AsyncMock(),
+    )
+
+    position = result.positions[0]
+    currency = result.currencies[0]
+
+    assert position.market_value == Decimal("200")
+    assert position.unrealized_pnl == Decimal("-100")
+    assert position.realized_pnl == Decimal("10")
+    assert position.total_pnl == Decimal("-90")
+
+    assert currency.total_pnl == Decimal("-90")
