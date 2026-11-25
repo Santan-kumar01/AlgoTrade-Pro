@@ -198,9 +198,24 @@ async def test_concurrent_buys_prevent_wallet_overdraft(
     """Verify concurrent BUY operations cannot overdraw a wallet."""
     user, wallet = trading_user
     service = TradingService()
+    trading_repo = TradingRepository()
+
+    # Bounded synchronization across coroutines (Python 3.10 compatible)
+    ready_event = asyncio.Event()
+    counter_lock = asyncio.Lock()
+    ready_count = 0
+
+    async def synchronize():
+        nonlocal ready_count
+        async with counter_lock:
+            ready_count += 1
+            if ready_count == 2:
+                ready_event.set()
+        await asyncio.wait_for(ready_event.wait(), timeout=5.0)
 
     async def execute_buy():
         async with db_session_factory() as session:
+            await synchronize()
             return await service.execute_buy(
                 user_id=user.id,
                 asset_id=trading_asset.id,
@@ -209,10 +224,13 @@ async def test_concurrent_buys_prevent_wallet_overdraft(
                 session=session,
             )
 
-    results = await asyncio.gather(
-        execute_buy(),
-        execute_buy(),
-        return_exceptions=True,
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            execute_buy(),
+            execute_buy(),
+            return_exceptions=True,
+        ),
+        timeout=10.0,
     )
 
     successful_trades = [
@@ -245,6 +263,19 @@ async def test_concurrent_buys_prevent_wallet_overdraft(
         assert updated_wallet.balance == Decimal("4000.00000000")
         assert len(transactions) == 1
         assert transactions[0].transaction_type == "BUY"
+        assert transactions[0].id == successful_trades[0].id
+        assert transactions[0].wallet_id == wallet.id
+        assert transactions[0].asset_id == trading_asset.id
+        assert transactions[0].quantity == Decimal("1.00000000")
+        assert transactions[0].price == Decimal("6000.00000000")
+        assert transactions[0].total_amount == Decimal("6000.00000000")
+
+        holdings = await trading_repo.get_net_holdings(
+            wallet.id,
+            trading_asset.id,
+            verification_session,
+        )
+        assert holdings == Decimal("1.00000000")
 
 
 @pytest.mark.asyncio
@@ -282,42 +313,38 @@ async def test_concurrent_sells_prevent_negative_holdings(
         )
         assert setup_holdings == Decimal("10.00000000")
 
-    # Step 2: Use barrier synchronization and timestamp tracking to coordinate & verify overlap
-    barrier = asyncio.Barrier(2)
-    start_times: dict[int, float] = {}
-    finish_times: dict[int, float] = {}
+    # Step 2: Python 3.10-compatible bounded synchronization across coroutines
+    ready_event = asyncio.Event()
+    counter_lock = asyncio.Lock()
+    ready_count = 0
 
-    async def execute_sell(op_id: int):
+    async def synchronize():
+        nonlocal ready_count
+        async with counter_lock:
+            ready_count += 1
+            if ready_count == 2:
+                ready_event.set()
+        await asyncio.wait_for(ready_event.wait(), timeout=5.0)
+
+    async def execute_sell():
         async with db_session_factory() as session:
-            # Bounded barrier wait prevents indefinite hangs
-            await asyncio.wait_for(barrier.wait(), timeout=5.0)
-            start_times[op_id] = asyncio.get_running_loop().time()
-            try:
-                return await service.execute_sell(
-                    user_id=user.id,
-                    asset_id=trading_asset.id,
-                    quantity=Decimal("8.00000000"),
-                    price=Decimal("120.00000000"),
-                    session=session,
-                )
-            finally:
-                finish_times[op_id] = asyncio.get_running_loop().time()
+            await synchronize()
+            return await service.execute_sell(
+                user_id=user.id,
+                asset_id=trading_asset.id,
+                quantity=Decimal("8.00000000"),
+                price=Decimal("120.00000000"),
+                session=session,
+            )
 
     # Step 3: Launch two SELL operations simultaneously with bounded overall timeout
     results = await asyncio.wait_for(
         asyncio.gather(
-            execute_sell(1),
-            execute_sell(2),
+            execute_sell(),
+            execute_sell(),
             return_exceptions=True,
         ),
         timeout=10.0,
-    )
-
-    # Verify temporal overlap: both operations were in flight simultaneously,
-    # proving overlapping coroutine execution intervals (not simultaneous database lock acquisition,
-    # as the exclusive wallet row lock mutually serializes them at the database level).
-    assert max(start_times.values()) < min(finish_times.values()), (
-        "Expected concurrent temporal overlap between coroutine execution intervals"
     )
 
     # Step 4: Verify exactly one SELL succeeds and the other fails with InsufficientHoldingsError
@@ -342,6 +369,7 @@ async def test_concurrent_sells_prevent_negative_holdings(
     successful_trade = successful_trades[0]
     failed_trade = failed_trades[0]
 
+    assert successful_trade.id is not None
     assert successful_trade.wallet_id == wallet.id
     assert successful_trade.asset_id == trading_asset.id
     assert successful_trade.transaction_type == "SELL"
@@ -392,15 +420,32 @@ async def test_concurrent_sells_prevent_negative_holdings(
         assert len(transactions) == 2
         assert transactions[0].transaction_type == "BUY"
         assert transactions[0].id == setup_buy.id
+        assert transactions[0].wallet_id == wallet.id
+        assert transactions[0].asset_id == trading_asset.id
         assert transactions[0].quantity == Decimal("10.00000000")
         assert transactions[0].price == Decimal("100.00000000")
         assert transactions[0].total_amount == Decimal("1000.00000000")
 
-        assert transactions[1].transaction_type == "SELL"
-        assert transactions[1].id == successful_trade.id
-        assert transactions[1].quantity == Decimal("8.00000000")
-        assert transactions[1].price == Decimal("120.00000000")
-        assert transactions[1].total_amount == Decimal("960.00000000")
+        # Verify exactly one SELL record exists in the ledger
+        sell_records = [tx for tx in transactions if tx.transaction_type == "SELL"]
+        assert len(sell_records) == 1, (
+            f"Expected exactly 1 SELL record in ledger, got {len(sell_records)}"
+        )
+        sell_record = sell_records[0]
+
+        # Verify persisted SELL transaction fields match successful execution
+        assert sell_record.id == successful_trade.id
+        assert sell_record.wallet_id == wallet.id
+        assert sell_record.asset_id == trading_asset.id
+        assert sell_record.transaction_type == "SELL"
+        assert sell_record.quantity == Decimal("8.00000000")
+        assert sell_record.price == Decimal("120.00000000")
+        assert sell_record.total_amount == Decimal("960.00000000")
+
+        assert {tx.id for tx in transactions} == {
+            setup_buy.id,
+            successful_trade.id,
+        }
 
 
 @pytest.mark.asyncio
