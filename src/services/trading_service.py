@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal, localcontext
 from uuid import UUID
 
@@ -10,11 +11,13 @@ from src.core.exceptions import (
     InsufficientFundsError,
     InsufficientHoldingsError,
     InvalidTradeAmountError,
+    TransactionNotFoundError,
     WalletNotFoundError,
 )
 from src.models import Asset, Transaction, Wallet
 from src.repositories.trading_repository import TradingRepository
 from src.repositories.wallet_repository import WalletRepository
+from src.schemas import TradeHistoryItemResponse, TradeHistoryResponse, TradeType
 
 
 class TradingService:
@@ -346,3 +349,116 @@ class TradingService:
             await session.flush()
 
         return transaction
+
+    async def get_transaction_history(
+        self,
+        user_id: UUID,
+        session: AsyncSession,
+        *,
+        asset_id: UUID | None = None,
+        transaction_type: str | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> TradeHistoryResponse:
+        """Retrieve paginated trade transaction history for an authenticated user."""
+        wallet = await self.wallet_repo.get_wallet_by_user_id(user_id, session)
+        if wallet is None:
+            raise WalletNotFoundError(user_id)
+
+        if start_at is not None and end_at is not None and start_at > end_at:
+            raise InvalidTradeAmountError("start_at cannot be after end_at.")
+
+        rows = await self.trading_repo.get_transaction_history(
+            wallet_id=wallet.id,
+            session=session,
+            asset_id=asset_id,
+            transaction_type=transaction_type,
+            start_at=start_at,
+            end_at=end_at,
+            limit=limit,
+            offset=offset,
+        )
+
+        total = await self.trading_repo.count_transaction_history(
+            wallet_id=wallet.id,
+            session=session,
+            asset_id=asset_id,
+            transaction_type=transaction_type,
+            start_at=start_at,
+            end_at=end_at,
+        )
+
+        items = [
+            TradeHistoryItemResponse(
+                id=tx.id,
+                wallet_id=tx.wallet_id,
+                asset_id=tx.asset_id,
+                symbol=asset.symbol,
+                asset_name=asset.name,
+                transaction_type=TradeType(tx.transaction_type),
+                quantity=tx.quantity,
+                price=tx.price,
+                total_amount=tx.total_amount,
+                currency=asset.currency,
+                created_at=tx.created_at,
+            )
+            for tx, asset in rows
+        ]
+
+        return TradeHistoryResponse(
+            total=total,
+            limit=limit,
+            offset=offset,
+            items=items,
+        )
+
+    async def get_transaction_by_id(
+        self,
+        transaction_id: UUID,
+        user_id: UUID,
+        session: AsyncSession,
+    ) -> TradeHistoryItemResponse:
+        """Retrieve details of a specific transaction for an authenticated user."""
+        wallet = await self.wallet_repo.get_wallet_by_user_id(user_id, session)
+        if wallet is None:
+            raise WalletNotFoundError(user_id)
+
+        row = await self.trading_repo.get_transaction_by_id(
+            transaction_id=transaction_id,
+            wallet_id=wallet.id,
+            session=session,
+        )
+        if row is None:
+            raise TransactionNotFoundError(transaction_id)
+
+        tx, asset = row
+        return TradeHistoryItemResponse(
+            id=tx.id,
+            wallet_id=tx.wallet_id,
+            asset_id=tx.asset_id,
+            symbol=asset.symbol,
+            asset_name=asset.name,
+            transaction_type=TradeType(tx.transaction_type),
+            quantity=tx.quantity,
+            price=tx.price,
+            total_amount=tx.total_amount,
+            currency=asset.currency,
+            created_at=tx.created_at,
+        )
+
+    async def get_user_holdings(
+        self,
+        user_id: UUID,
+        session: AsyncSession,
+    ) -> dict[UUID, Decimal]:
+        """Retrieve active positive net holdings across all assets for an authenticated user."""
+        wallet = await self.wallet_repo.get_wallet_by_user_id(user_id, session)
+        if wallet is None:
+            raise WalletNotFoundError(user_id)
+
+        return await self.trading_repo.get_all_net_holdings(
+            wallet_id=wallet.id,
+            session=session,
+        )

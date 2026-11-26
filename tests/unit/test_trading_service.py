@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -12,10 +13,12 @@ from src.core.exceptions import (
     InsufficientFundsError,
     InsufficientHoldingsError,
     InvalidTradeAmountError,
+    TransactionNotFoundError,
     WalletNotFoundError,
 )
 from src.models import Asset, Transaction
 from src.repositories.trading_repository import TradingRepository
+from src.schemas import TradeType
 from src.services.trading_service import TradingService
 
 
@@ -2079,3 +2082,200 @@ async def test_mock_transactional_state_rollback_and_lock_release_on_exception()
         match="Cannot acquire lock without an active transaction context on session",
     ):
         await tx_state.acquire_lock(session4)
+
+
+# ============================================================================
+# Phase 6: Transaction History & Holdings Service Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_get_transaction_history_success(trading_setup):
+    """Verify get_transaction_history returns paginated TradeHistoryResponse with joined asset data."""
+    setup = trading_setup
+    now = datetime.now(timezone.utc)
+    tx = Transaction(
+        id=uuid4(),
+        wallet_id=setup["wallet"].id,
+        asset_id=setup["asset_id"],
+        transaction_type="BUY",
+        quantity=Decimal("1.50000000"),
+        price=Decimal("50000.00000000"),
+        total_amount=Decimal("75000.00000000"),
+        created_at=now,
+    )
+    asset = Asset(
+        id=setup["asset_id"],
+        symbol="BTC",
+        name="Bitcoin",
+        currency="USD",
+        is_active=True,
+    )
+
+    setup["wallet_repo"].get_wallet_by_user_id = AsyncMock(return_value=setup["wallet"])
+    setup["trading_repo"].get_transaction_history = AsyncMock(return_value=[(tx, asset)])
+    setup["trading_repo"].count_transaction_history = AsyncMock(return_value=1)
+
+    result = await setup["service"].get_transaction_history(
+        user_id=setup["user_id"],
+        session=setup["session"],
+        limit=10,
+        offset=0,
+    )
+
+    assert result.total == 1
+    assert result.limit == 10
+    assert result.offset == 0
+    assert len(result.items) == 1
+    item = result.items[0]
+    assert item.id == tx.id
+    assert item.wallet_id == setup["wallet"].id
+    assert item.asset_id == asset.id
+    assert item.symbol == "BTC"
+    assert item.asset_name == "Bitcoin"
+    assert item.transaction_type == TradeType.BUY
+    assert item.quantity == Decimal("1.50000000")
+    assert item.price == Decimal("50000.00000000")
+    assert item.total_amount == Decimal("75000.00000000")
+    assert item.currency == "USD"
+
+
+@pytest.mark.asyncio
+async def test_get_transaction_history_wallet_not_found(trading_setup):
+    """Verify get_transaction_history raises WalletNotFoundError when user has no wallet."""
+    setup = trading_setup
+    setup["wallet_repo"].get_wallet_by_user_id = AsyncMock(return_value=None)
+
+    with pytest.raises(WalletNotFoundError) as exc_info:
+        await setup["service"].get_transaction_history(
+            user_id=setup["user_id"],
+            session=setup["session"],
+        )
+    assert exc_info.value.user_id == setup["user_id"]
+
+
+@pytest.mark.asyncio
+async def test_get_transaction_history_invalid_date_range(trading_setup):
+    """Verify get_transaction_history raises InvalidTradeAmountError when start_at > end_at."""
+    setup = trading_setup
+    setup["wallet_repo"].get_wallet_by_user_id = AsyncMock(return_value=setup["wallet"])
+
+    start = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    with pytest.raises(InvalidTradeAmountError, match="start_at cannot be after end_at"):
+        await setup["service"].get_transaction_history(
+            user_id=setup["user_id"],
+            session=setup["session"],
+            start_at=start,
+            end_at=end,
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_transaction_by_id_success(trading_setup):
+    """Verify get_transaction_by_id returns TradeHistoryItemResponse for owned transaction."""
+    setup = trading_setup
+    now = datetime.now(timezone.utc)
+    tx = Transaction(
+        id=uuid4(),
+        wallet_id=setup["wallet"].id,
+        asset_id=setup["asset_id"],
+        transaction_type="SELL",
+        quantity=Decimal("0.50000000"),
+        price=Decimal("60000.00000000"),
+        total_amount=Decimal("30000.00000000"),
+        created_at=now,
+    )
+    asset = Asset(
+        id=setup["asset_id"],
+        symbol="BTC",
+        name="Bitcoin",
+        currency="USD",
+        is_active=True,
+    )
+
+    setup["wallet_repo"].get_wallet_by_user_id = AsyncMock(return_value=setup["wallet"])
+    setup["trading_repo"].get_transaction_by_id = AsyncMock(return_value=(tx, asset))
+
+    result = await setup["service"].get_transaction_by_id(
+        transaction_id=tx.id,
+        user_id=setup["user_id"],
+        session=setup["session"],
+    )
+
+    assert result.id == tx.id
+    assert result.transaction_type == TradeType.SELL
+    assert result.quantity == Decimal("0.50000000")
+    assert result.price == Decimal("60000.00000000")
+    assert result.total_amount == Decimal("30000.00000000")
+    assert result.symbol == "BTC"
+    assert result.asset_name == "Bitcoin"
+
+
+@pytest.mark.asyncio
+async def test_get_transaction_by_id_not_found(trading_setup):
+    """Verify get_transaction_by_id raises TransactionNotFoundError if ID does not exist."""
+    setup = trading_setup
+    tx_id = uuid4()
+    setup["wallet_repo"].get_wallet_by_user_id = AsyncMock(return_value=setup["wallet"])
+    setup["trading_repo"].get_transaction_by_id = AsyncMock(return_value=None)
+
+    with pytest.raises(TransactionNotFoundError) as exc_info:
+        await setup["service"].get_transaction_by_id(
+            transaction_id=tx_id,
+            user_id=setup["user_id"],
+            session=setup["session"],
+        )
+    assert exc_info.value.transaction_id == tx_id
+
+
+@pytest.mark.asyncio
+async def test_get_transaction_by_id_wallet_not_found(trading_setup):
+    """Verify get_transaction_by_id raises WalletNotFoundError if wallet does not exist."""
+    setup = trading_setup
+    tx_id = uuid4()
+    setup["wallet_repo"].get_wallet_by_user_id = AsyncMock(return_value=None)
+
+    with pytest.raises(WalletNotFoundError) as exc_info:
+        await setup["service"].get_transaction_by_id(
+            transaction_id=tx_id,
+            user_id=setup["user_id"],
+            session=setup["session"],
+        )
+    assert exc_info.value.user_id == setup["user_id"]
+
+
+@pytest.mark.asyncio
+async def test_get_user_holdings_success(trading_setup):
+    """Verify get_user_holdings returns dictionary of net positive holdings."""
+    setup = trading_setup
+    expected_holdings = {setup["asset_id"]: Decimal("4.25000000")}
+
+    setup["wallet_repo"].get_wallet_by_user_id = AsyncMock(return_value=setup["wallet"])
+    setup["trading_repo"].get_all_net_holdings = AsyncMock(return_value=expected_holdings)
+
+    result = await setup["service"].get_user_holdings(
+        user_id=setup["user_id"],
+        session=setup["session"],
+    )
+
+    assert result == expected_holdings
+    setup["trading_repo"].get_all_net_holdings.assert_awaited_once_with(
+        wallet_id=setup["wallet"].id,
+        session=setup["session"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_user_holdings_wallet_not_found(trading_setup):
+    """Verify get_user_holdings raises WalletNotFoundError if wallet does not exist."""
+    setup = trading_setup
+    setup["wallet_repo"].get_wallet_by_user_id = AsyncMock(return_value=None)
+
+    with pytest.raises(WalletNotFoundError) as exc_info:
+        await setup["service"].get_user_holdings(
+            user_id=setup["user_id"],
+            session=setup["session"],
+        )
+    assert exc_info.value.user_id == setup["user_id"]

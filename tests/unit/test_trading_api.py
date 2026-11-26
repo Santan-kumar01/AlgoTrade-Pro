@@ -17,10 +17,16 @@ from src.core.exceptions import (
     InsufficientHoldingsError,
     InvalidTradeAmountError,
     TradingEngineException,
+    TransactionNotFoundError,
     WalletNotFoundError,
 )
 from src.main import app
 from src.models import Transaction, User
+from src.schemas import (
+    TradeHistoryItemResponse,
+    TradeHistoryResponse,
+    TradeType,
+)
 
 
 @pytest.fixture
@@ -43,6 +49,9 @@ def api_setup():
     mock_service = MagicMock()
     mock_service.execute_buy = AsyncMock()
     mock_service.execute_sell = AsyncMock()
+    mock_service.get_transaction_history = AsyncMock()
+    mock_service.get_transaction_by_id = AsyncMock()
+    mock_service.get_user_holdings = AsyncMock()
 
     async def override_get_db():
         yield mock_db
@@ -722,3 +731,243 @@ def test_sell_route_is_registered():
     paths = app.openapi()["paths"]
     assert "/api/v1/trades/sell" in paths
     assert "post" in paths["/api/v1/trades/sell"]
+
+
+# ============================================================================
+# Phase 6: Transaction History & Holdings API Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_get_trade_history_success(api_setup):
+    """Verify GET /api/v1/trades/history returns HTTP 200 with TradeHistoryResponse."""
+    setup = api_setup
+    now = datetime.now(timezone.utc)
+    item = TradeHistoryItemResponse(
+        id=uuid4(),
+        wallet_id=setup["wallet_id"],
+        asset_id=setup["asset_id"],
+        symbol="BTC",
+        asset_name="Bitcoin",
+        transaction_type=TradeType.BUY,
+        quantity=Decimal("1.50000000"),
+        price=Decimal("50000.00000000"),
+        total_amount=Decimal("75000.00000000"),
+        currency="USD",
+        created_at=now,
+    )
+    expected_response = TradeHistoryResponse(
+        total=1,
+        limit=50,
+        offset=0,
+        items=[item],
+    )
+    setup["mock_service"].get_transaction_history.return_value = expected_response
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/v1/trades/history",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 1
+    assert data["limit"] == 50
+    assert data["offset"] == 0
+    assert len(data["items"]) == 1
+    assert data["items"][0]["symbol"] == "BTC"
+    assert data["items"][0]["transaction_type"] == "BUY"
+
+
+@pytest.mark.asyncio
+async def test_get_trade_history_with_query_params(api_setup):
+    """Verify GET /api/v1/trades/history passes query parameters to service."""
+    setup = api_setup
+    expected_response = TradeHistoryResponse(
+        total=0,
+        limit=10,
+        offset=20,
+        items=[],
+    )
+    setup["mock_service"].get_transaction_history.return_value = expected_response
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            f"/api/v1/trades/history?asset_id={setup['asset_id']}&transaction_type=SELL&limit=10&offset=20",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+
+    assert response.status_code == 200
+    setup["mock_service"].get_transaction_history.assert_awaited_once()
+    _, kwargs = setup["mock_service"].get_transaction_history.call_args
+    assert kwargs["asset_id"] == setup["asset_id"]
+    assert kwargs["transaction_type"] == "SELL"
+    assert kwargs["limit"] == 10
+    assert kwargs["offset"] == 20
+
+
+@pytest.mark.asyncio
+async def test_get_trade_history_naive_start_at_returns_422(api_setup):
+    """Verify GET /api/v1/trades/history returns 422 if start_at lacks timezone."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/v1/trades/history?start_at=2026-01-01T00:00:00",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+
+    assert response.status_code == 422
+    assert "start_at must include a timezone" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_get_trade_history_start_after_end_returns_422(api_setup):
+    """Verify GET /api/v1/trades/history returns 422 if start_at is after end_at."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/v1/trades/history?start_at=2026-02-01T00:00:00Z&end_at=2026-01-01T00:00:00Z",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+
+    assert response.status_code == 422
+    assert "start_at cannot be after end_at" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_get_trade_history_wallet_not_found_returns_404(api_setup):
+    """Verify GET /api/v1/trades/history returns 404 when user has no wallet."""
+    setup = api_setup
+    setup["mock_service"].get_transaction_history.side_effect = WalletNotFoundError(setup["user_id"])
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/v1/trades/history",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "User trading wallet not found."
+
+
+@pytest.mark.asyncio
+async def test_get_holdings_success(api_setup):
+    """Verify GET /api/v1/trades/holdings returns dictionary of net holdings."""
+    setup = api_setup
+    setup["mock_service"].get_user_holdings.return_value = {
+        setup["asset_id"]: Decimal("5.25000000"),
+    }
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/v1/trades/holdings",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert str(setup["asset_id"]) in data
+    assert Decimal(data[str(setup["asset_id"])]) == Decimal("5.25000000")
+
+
+@pytest.mark.asyncio
+async def test_get_holdings_wallet_not_found_returns_404(api_setup):
+    """Verify GET /api/v1/trades/holdings returns 404 when user has no wallet."""
+    setup = api_setup
+    setup["mock_service"].get_user_holdings.side_effect = WalletNotFoundError(setup["user_id"])
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/v1/trades/holdings",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_trade_by_id_success(api_setup):
+    """Verify GET /api/v1/trades/{transaction_id} returns transaction details."""
+    setup = api_setup
+    tx_id = uuid4()
+    now = datetime.now(timezone.utc)
+    item = TradeHistoryItemResponse(
+        id=tx_id,
+        wallet_id=setup["wallet_id"],
+        asset_id=setup["asset_id"],
+        symbol="BTC",
+        asset_name="Bitcoin",
+        transaction_type=TradeType.BUY,
+        quantity=Decimal("1.00000000"),
+        price=Decimal("60000.00000000"),
+        total_amount=Decimal("60000.00000000"),
+        currency="USD",
+        created_at=now,
+    )
+    setup["mock_service"].get_transaction_by_id.return_value = item
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            f"/api/v1/trades/{tx_id}",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == str(tx_id)
+    assert data["symbol"] == "BTC"
+    assert data["transaction_type"] == "BUY"
+
+
+@pytest.mark.asyncio
+async def test_get_trade_by_id_not_found_returns_404(api_setup):
+    """Verify GET /api/v1/trades/{transaction_id} returns 404 if transaction not found."""
+    setup = api_setup
+    tx_id = uuid4()
+    setup["mock_service"].get_transaction_by_id.side_effect = TransactionNotFoundError(tx_id)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            f"/api/v1/trades/{tx_id}",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+
+    assert response.status_code == 404
+    assert str(tx_id) in response.json()["detail"]
+
+
+def test_history_and_holdings_routes_registered():
+    """Verify GET history, holdings, and transaction ID routes are registered."""
+    paths = app.openapi()["paths"]
+    assert "/api/v1/trades/history" in paths
+    assert "get" in paths["/api/v1/trades/history"]
+    assert "/api/v1/trades/holdings" in paths
+    assert "get" in paths["/api/v1/trades/holdings"]
+    assert "/api/v1/trades/{transaction_id}" in paths
+    assert "get" in paths["/api/v1/trades/{transaction_id}"]

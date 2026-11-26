@@ -75,3 +75,12 @@ class InvalidTradeAmountError(TradingEngineException):
             message=message,
             error_code="INVALID_TRADE_AMOUNT",
         )
+
+
+class TransactionNotFoundError(TradingEngineException):
+    def __init__(self, transaction_id: UUID):
+        super().__init__(
+            message=f"Transaction with ID {transaction_id} not found.",
+            error_code="TRANSACTION_NOT_FOUND",
+        )
+        self.transaction_id = transaction_id
