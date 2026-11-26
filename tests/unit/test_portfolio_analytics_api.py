@@ -65,6 +65,10 @@ async def test_authenticated_user_can_retrieve_portfolio_analytics(
                 total_pnl=Decimal("275"),
             ),
         ),
+        concentration_ratio=Decimal("100"),
+        concentration_threshold=Decimal("50"),
+        is_concentrated=True,
+        concentrated_positions=("AAPL",),
     )
 
     mock_db = AsyncMock()
@@ -124,6 +128,11 @@ async def test_authenticated_user_can_retrieve_portfolio_analytics(
         assert data["currencies"][0]["currency"] == "USD"
         assert data["currencies"][0]["total_pnl"] == "275"
 
+        assert data["concentration_ratio"] == "100"
+        assert data["concentration_threshold"] == "50"
+        assert data["is_concentrated"] is True
+        assert data["concentrated_positions"] == ["AAPL"]
+
         mock_wallet_repository.get_wallet_by_user_id.assert_awaited_once_with(
             user_id,
             mock_db,
@@ -136,6 +145,7 @@ async def test_authenticated_user_can_retrieve_portfolio_analytics(
 
     finally:
         app.dependency_overrides.clear()
+
 
 @pytest.mark.asyncio
 async def test_portfolio_analytics_returns_404_when_wallet_missing(monkeypatch):
@@ -184,6 +194,7 @@ async def test_portfolio_analytics_returns_404_when_wallet_missing(monkeypatch):
     finally:
         app.dependency_overrides.clear()
 
+
 @pytest.mark.asyncio
 async def test_portfolio_analytics_returns_422_for_invalid_market_prices(
     monkeypatch,
@@ -210,8 +221,8 @@ async def test_portfolio_analytics_returns_422_for_invalid_market_prices(
         MarketPriceValidationError,
     )
 
-    mock_analytics_service.get_analytics.side_effect = (
-        MarketPriceValidationError("Internal validation detail")
+    mock_analytics_service.get_analytics.side_effect = MarketPriceValidationError(
+        "Internal validation detail"
     )
 
     async def override_get_db():
@@ -248,6 +259,7 @@ async def test_portfolio_analytics_returns_422_for_invalid_market_prices(
 
     finally:
         app.dependency_overrides.clear()
+
 
 @pytest.mark.asyncio
 async def test_portfolio_analytics_returns_500_without_exposing_internal_error(
@@ -302,13 +314,12 @@ async def test_portfolio_analytics_returns_500_without_exposing_internal_error(
             )
 
         assert response.status_code == 500
-        assert response.json()["detail"] == (
-            "Unable to calculate portfolio analytics."
-        )
+        assert response.json()["detail"] == ("Unable to calculate portfolio analytics.")
         assert "Sensitive internal calculation details" not in response.text
 
     finally:
         app.dependency_overrides.clear()
+
 
 @pytest.mark.asyncio
 async def test_portfolio_analytics_rejects_zero_market_price(monkeypatch):
@@ -355,6 +366,7 @@ async def test_portfolio_analytics_rejects_zero_market_price(monkeypatch):
 
     finally:
         app.dependency_overrides.clear()
+
 
 @pytest.mark.asyncio
 async def test_portfolio_analytics_rejects_duplicate_asset_ids(monkeypatch):
@@ -407,6 +419,7 @@ async def test_portfolio_analytics_rejects_duplicate_asset_ids(monkeypatch):
     finally:
         app.dependency_overrides.clear()
 
+
 @pytest.mark.asyncio
 async def test_portfolio_analytics_rejects_missing_token():
     async with AsyncClient(
@@ -419,6 +432,7 @@ async def test_portfolio_analytics_rejects_missing_token():
         )
 
     assert response.status_code == 401
+
 
 @pytest.mark.asyncio
 async def test_portfolio_analytics_rejects_invalid_token():

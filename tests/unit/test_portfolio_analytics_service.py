@@ -113,8 +113,12 @@ async def test_analytics_calculates_allocation_by_currency():
 
     by_symbol = {position.symbol: position for position in result.positions}
 
-    assert by_symbol["BTC"].allocation_percentage == Decimal("66.6666666666666666666666666666666666666666666666666666666667")
-    assert by_symbol["ETH"].allocation_percentage == Decimal("33.3333333333333333333333333333333333333333333333333333333333")
+    assert by_symbol["BTC"].allocation_percentage == Decimal(
+        "66.6666666666666666666666666666666666666666666666666666666667"
+    )
+    assert by_symbol["ETH"].allocation_percentage == Decimal(
+        "33.3333333333333333333333333333333333333333333333333333333333"
+    )
 
 
 @pytest.mark.asyncio
@@ -189,6 +193,7 @@ async def test_analytics_rejects_invalid_market_price(invalid_price):
             AsyncMock(),
         )
 
+
 @pytest.mark.asyncio
 async def test_analytics_rejects_unknown_asset_market_price():
     wallet_id = uuid4()
@@ -209,6 +214,7 @@ async def test_analytics_rejects_unknown_asset_market_price():
             {unknown_asset_id: Decimal("100")},
             AsyncMock(),
         )
+
 
 @pytest.mark.asyncio
 async def test_analytics_keeps_currency_allocations_separate():
@@ -263,9 +269,7 @@ async def test_analytics_keeps_currency_allocations_separate():
     )
 
     by_symbol = {position.symbol: position for position in result.positions}
-    by_currency = {
-        currency.currency: currency for currency in result.currencies
-    }
+    by_currency = {currency.currency: currency for currency in result.currencies}
 
     assert by_symbol["BTC"].market_value == Decimal("300")
     assert by_symbol["BTC"].allocation_percentage == Decimal("100")
@@ -275,7 +279,6 @@ async def test_analytics_keeps_currency_allocations_separate():
 
     assert by_currency["USD"].market_value == Decimal("300")
     assert by_currency["INR"].market_value == Decimal("12000")
-
 
 
 @pytest.mark.asyncio
@@ -366,7 +369,164 @@ async def test_analytics_rejects_non_dictionary_market_prices():
     ):
         await service.get_analytics(wallet_id, [], AsyncMock())
 
-    portfolio_service.get_portfolio.assert_not_awaited() 
+    portfolio_service.get_portfolio.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_analytics_detects_portfolio_concentration():
+    wallet_id = uuid4()
+    first_asset_id = uuid4()
+    second_asset_id = uuid4()
+
+    portfolio_service = AsyncMock()
+    portfolio_service.get_portfolio.return_value = PortfolioSummary(
+        wallet_id=wallet_id,
+        positions=(
+            PortfolioPosition(
+                asset_id=first_asset_id,
+                symbol="BTC",
+                name="Bitcoin",
+                asset_type="CRYPTO",
+                currency="USD",
+                quantity=Decimal("7"),
+                average_cost=Decimal("100"),
+                total_invested=Decimal("700"),
+                realized_pnl=Decimal("0"),
+            ),
+            PortfolioPosition(
+                asset_id=second_asset_id,
+                symbol="ETH",
+                name="Ethereum",
+                asset_type="CRYPTO",
+                currency="USD",
+                quantity=Decimal("3"),
+                average_cost=Decimal("100"),
+                total_invested=Decimal("300"),
+                realized_pnl=Decimal("0"),
+            ),
+        ),
+        realized_pnl_by_currency={"USD": Decimal("0")},
+    )
+
+    service = PortfolioAnalyticsService(portfolio_service)
+    result = await service.get_analytics(
+        wallet_id,
+        {
+            first_asset_id: Decimal("100"),
+            second_asset_id: Decimal("100"),
+        },
+        AsyncMock(),
+    )
+
+    assert result.concentration_ratio == Decimal("70")
+    assert result.concentration_threshold == Decimal("50")
+    assert result.is_concentrated is True
+    assert result.concentrated_positions == ("BTC",)
+
+
+@pytest.mark.asyncio
+async def test_analytics_detects_concentration_at_exact_threshold():
+    wallet_id = uuid4()
+    first_asset_id = uuid4()
+    second_asset_id = uuid4()
+
+    portfolio_service = AsyncMock()
+    portfolio_service.get_portfolio.return_value = PortfolioSummary(
+        wallet_id=wallet_id,
+        positions=(
+            PortfolioPosition(
+                asset_id=first_asset_id,
+                symbol="BTC",
+                name="Bitcoin",
+                asset_type="CRYPTO",
+                currency="USD",
+                quantity=Decimal("1"),
+                average_cost=Decimal("100"),
+                total_invested=Decimal("100"),
+                realized_pnl=Decimal("0"),
+            ),
+            PortfolioPosition(
+                asset_id=second_asset_id,
+                symbol="ETH",
+                name="Ethereum",
+                asset_type="CRYPTO",
+                currency="USD",
+                quantity=Decimal("1"),
+                average_cost=Decimal("100"),
+                total_invested=Decimal("100"),
+                realized_pnl=Decimal("0"),
+            ),
+        ),
+        realized_pnl_by_currency={"USD": Decimal("0")},
+    )
+
+    service = PortfolioAnalyticsService(portfolio_service)
+    result = await service.get_analytics(
+        wallet_id,
+        {
+            first_asset_id: Decimal("100"),
+            second_asset_id: Decimal("100"),
+        },
+        AsyncMock(),
+    )
+
+    assert result.concentration_ratio == Decimal("50")
+    assert result.is_concentrated is True
+    assert result.concentrated_positions == ("BTC", "ETH")
+
+
+@pytest.mark.asyncio
+async def test_analytics_disables_global_concentration_for_multiple_currencies():
+    wallet_id = uuid4()
+    usd_asset_id = uuid4()
+    inr_asset_id = uuid4()
+
+    portfolio_service = AsyncMock()
+    portfolio_service.get_portfolio.return_value = PortfolioSummary(
+        wallet_id=wallet_id,
+        positions=(
+            PortfolioPosition(
+                asset_id=usd_asset_id,
+                symbol="BTC",
+                name="Bitcoin",
+                asset_type="CRYPTO",
+                currency="USD",
+                quantity=Decimal("1"),
+                average_cost=Decimal("100"),
+                total_invested=Decimal("100"),
+                realized_pnl=Decimal("0"),
+            ),
+            PortfolioPosition(
+                asset_id=inr_asset_id,
+                symbol="GOLD",
+                name="Gold",
+                asset_type="COMMODITY",
+                currency="INR",
+                quantity=Decimal("1"),
+                average_cost=Decimal("100"),
+                total_invested=Decimal("100"),
+                realized_pnl=Decimal("0"),
+            ),
+        ),
+        realized_pnl_by_currency={
+            "USD": Decimal("0"),
+            "INR": Decimal("0"),
+        },
+    )
+
+    service = PortfolioAnalyticsService(portfolio_service)
+    result = await service.get_analytics(
+        wallet_id,
+        {
+            usd_asset_id: Decimal("100"),
+            inr_asset_id: Decimal("100"),
+        },
+        AsyncMock(),
+    )
+
+    assert result.concentration_ratio is None
+    assert result.is_concentrated is None
+    assert result.concentrated_positions == ()
 
 
 @pytest.mark.asyncio
