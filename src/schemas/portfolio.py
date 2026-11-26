@@ -108,6 +108,11 @@ class PortfolioAnalyticsResponse(BaseModel):
     wallet_id: UUID
     positions: tuple[PortfolioPositionAnalyticsResponse, ...]
     currencies: tuple[CurrencyAnalyticsResponse, ...]
+    concentration_ratio: Decimal | None = None
+    concentration_threshold: Decimal = Decimal("50")
+    is_concentrated: bool | None = None
+    concentrated_positions: tuple[str, ...] = ()
+
 
 class PortfolioSnapshotResponse(BaseModel):
     """Historical portfolio snapshot returned to the wallet owner."""

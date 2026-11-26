@@ -38,6 +38,10 @@ class PortfolioAnalytics:
     wallet_id: UUID
     positions: tuple[PositionAnalytics, ...]
     currencies: tuple[CurrencyAnalytics, ...]
+    concentration_ratio: Decimal | None = None
+    concentration_threshold: Decimal = Decimal("50")
+    is_concentrated: bool | None = None
+    concentrated_positions: tuple[str, ...] = ()
 
 
 class MarketPriceValidationError(ValueError):
@@ -50,12 +54,23 @@ class PortfolioAnalyticsService:
     def __init__(
         self,
         portfolio_service: PortfolioService | None = None,
+        concentration_threshold: Decimal = Decimal("50"),
     ) -> None:
+        if (
+            not isinstance(concentration_threshold, Decimal)
+            or not concentration_threshold.is_finite()
+            or concentration_threshold <= ZERO
+            or concentration_threshold > Decimal("100")
+        ):
+            raise ValueError(
+                "Concentration threshold must be a finite Decimal "
+                "greater than 0 and at most 100."
+            )
+
         self.portfolio_service = (
-            portfolio_service
-            if portfolio_service is not None
-            else PortfolioService()
+            portfolio_service if portfolio_service is not None else PortfolioService()
         )
+        self.concentration_threshold = concentration_threshold
 
     @staticmethod
     def _validate_market_prices(
@@ -123,9 +138,7 @@ class PortfolioAnalyticsService:
             currency_totals[currency] = {
                 "invested": ZERO,
                 "market_value": ZERO,
-                "realized": portfolio.realized_pnl_by_currency.get(
-                    currency, ZERO
-                ),
+                "realized": portfolio.realized_pnl_by_currency.get(currency, ZERO),
                 "unrealized": ZERO,
             }
 
@@ -181,6 +194,24 @@ class PortfolioAnalyticsService:
                 for position in position_results
             ]
 
+            concentration_ratio = None
+            is_concentrated = None
+            concentrated_positions = ()
+
+            if not position_results:
+                is_concentrated = False
+                concentration_ratio = ZERO
+            elif len(currency_totals) == 1:
+                concentration_ratio = max(
+                    position.allocation_percentage for position in position_results
+                )
+                concentrated_positions = tuple(
+                    position.symbol
+                    for position in position_results
+                    if position.allocation_percentage >= self.concentration_threshold
+                )
+                is_concentrated = concentration_ratio >= self.concentration_threshold
+
             currency_results = []
 
             for currency in sorted(currency_totals):
@@ -202,4 +233,8 @@ class PortfolioAnalyticsService:
             wallet_id=wallet_id,
             positions=tuple(position_results),
             currencies=tuple(currency_results),
+            concentration_ratio=concentration_ratio,
+            concentration_threshold=self.concentration_threshold,
+            is_concentrated=is_concentrated,
+            concentrated_positions=concentrated_positions,
         )
