@@ -1,3 +1,4 @@
+import asyncio
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -1606,3 +1607,475 @@ async def test_execute_sell_rejects_invalid_monetary_inputs_without_side_effects
 
     setup["wallet_repo"].update_balance.assert_not_awaited()
     setup["trading_repo"].create_transaction.assert_not_awaited()
+
+
+# ============================================================================
+# Service-Level Coroutine Serialization Unit Tests (Python 3.10+)
+# ============================================================================
+
+
+class MockTransactionalState:
+    """Manages state snapshotting and rollback simulation for service-level coroutine tests.
+
+    IMPORTANT ARCHITECTURAL NOTE:
+    This class models service-level coroutine serialization and transaction rollback
+    at the Python asyncio boundary using in-memory locks and state snapshots. It verifies
+    that TradingService correctly coordinates with repository dependencies and propagates
+    errors, but it does NOT simulate PostgreSQL row-level locks (SELECT FOR UPDATE) or
+    MVCC transaction isolation semantics. Full concurrency and row-lock behavior must be
+    verified via database-backed integration tests against PostgreSQL.
+    """
+
+    def __init__(
+        self,
+        initial_balance: Decimal,
+        initial_holdings: Decimal = Decimal("0"),
+    ) -> None:
+        self.balance = initial_balance
+        self.holdings = initial_holdings
+        self.transactions: list[Transaction] = []
+        self.lock = asyncio.Lock()
+
+    async def acquire_lock(self, session) -> None:
+        """Acquire the state lock on behalf of the session's active transaction."""
+        tx_context = getattr(session, "tx_context", None)
+        if tx_context is None:
+            raise RuntimeError(
+                "Cannot acquire lock without an active transaction context on session."
+            )
+        await tx_context.acquire_lock()
+
+    def create_session(self, wallet):
+        state = self
+
+        class MockTxContext:
+            def __init__(self):
+                self.has_lock = False
+                self.snapshot_balance = None
+                self.snapshot_holdings = None
+                self.snapshot_tx_count = None
+
+            async def acquire_lock(self):
+                if self.has_lock:
+                    return
+                await state.lock.acquire()
+                self.has_lock = True
+                # Snapshot state strictly AFTER lock acquisition to prevent stale snapshots
+                self.snapshot_balance = state.balance
+                self.snapshot_holdings = state.holdings
+                self.snapshot_tx_count = len(state.transactions)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_val, tb):
+                try:
+                    if exc_type is not None and self.has_lock:
+                        # Transaction rollback: restore state to snapshot taken upon lock acquisition
+                        state.balance = self.snapshot_balance
+                        wallet.balance = self.snapshot_balance
+                        state.holdings = self.snapshot_holdings
+                        state.transactions = state.transactions[
+                            : self.snapshot_tx_count
+                        ]
+                finally:
+                    # Release lock ONLY if this transaction context successfully acquired it
+                    if self.has_lock:
+                        self.has_lock = False
+                        state.lock.release()
+                return False
+
+        class MockSession:
+            def __init__(self):
+                self.tx_context = None
+                self.flush = AsyncMock()
+
+            def begin(self):
+                self.tx_context = MockTxContext()
+                return self.tx_context
+
+        return MockSession()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_buys_prevent_overdraft_at_service_boundary():
+    """Verify service-level coroutine serialization prevents balance overdraft.
+
+    Demonstrates that when two coroutines execute execute_buy concurrently and the
+    repository boundary serializes access, the first debit reduces available balance,
+    causing the second operation to fail with InsufficientFundsError and roll back.
+    """
+    user_id = uuid4()
+    asset_id = uuid4()
+
+    wallet = MagicMock()
+    wallet.id = uuid4()
+    wallet.user_id = user_id
+    wallet.balance = Decimal("1000.00000000")
+    wallet.currency = "USD"
+
+    asset = MagicMock(spec=Asset)
+    asset.id = asset_id
+    asset.currency = "USD"
+    asset.is_active = True
+
+    tx_state = MockTransactionalState(initial_balance=Decimal("1000.00000000"))
+
+    async def mock_get_wallet(uid, session):
+        await tx_state.acquire_lock(session)
+        wallet.balance = tx_state.balance
+        return wallet
+
+    async def mock_update_balance(w, new_bal):
+        tx_state.balance = new_bal
+        w.balance = new_bal
+        return w
+
+    async def mock_create_tx(tx, session):
+        tx_state.transactions.append(tx)
+        return tx
+
+    wallet_repo = MagicMock()
+    wallet_repo.get_wallet_for_user_update = AsyncMock(side_effect=mock_get_wallet)
+    wallet_repo.update_balance = AsyncMock(side_effect=mock_update_balance)
+
+    trading_repo = MagicMock()
+    trading_repo.get_asset_by_id = AsyncMock(return_value=asset)
+    trading_repo.create_transaction = AsyncMock(side_effect=mock_create_tx)
+
+    service = TradingService(
+        wallet_repo=wallet_repo,
+        trading_repo=trading_repo,
+    )
+
+    ready_event = asyncio.Event()
+    counter_lock = asyncio.Lock()
+    ready_count = 0
+
+    async def sync():
+        nonlocal ready_count
+        async with counter_lock:
+            ready_count += 1
+            if ready_count == 2:
+                ready_event.set()
+        await asyncio.wait_for(ready_event.wait(), timeout=2.0)
+
+    async def run_buy():
+        await sync()
+        return await service.execute_buy(
+            user_id=user_id,
+            asset_id=asset_id,
+            quantity=Decimal("1.00000000"),
+            price=Decimal("600.00000000"),
+            session=tx_state.create_session(wallet),
+        )
+
+    results = await asyncio.wait_for(
+        asyncio.gather(run_buy(), run_buy(), return_exceptions=True),
+        timeout=5.0,
+    )
+
+    successes = [r for r in results if isinstance(r, Transaction)]
+    failures = [r for r in results if isinstance(r, InsufficientFundsError)]
+
+    assert len(successes) == 1
+    assert len(failures) == 1
+    # Exactly $600 deducted from $1000; the second failed BUY leaves balance unchanged
+    assert wallet.balance == Decimal("400.00000000")
+    assert tx_state.balance == Decimal("400.00000000")
+    assert len(tx_state.transactions) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sells_prevent_negative_holdings_at_service_boundary():
+    """Verify service-level coroutine serialization prevents holdings overselling.
+
+    Demonstrates that when two coroutines execute execute_sell concurrently and the
+    repository boundary serializes access, the first trade depletes holdings, causing
+    the second operation to fail with InsufficientHoldingsError and roll back.
+    """
+    user_id = uuid4()
+    asset_id = uuid4()
+
+    wallet = MagicMock()
+    wallet.id = uuid4()
+    wallet.user_id = user_id
+    wallet.balance = Decimal("1000.00000000")
+    wallet.currency = "USD"
+
+    asset = MagicMock(spec=Asset)
+    asset.id = asset_id
+    asset.currency = "USD"
+    asset.is_active = True
+
+    tx_state = MockTransactionalState(
+        initial_balance=Decimal("1000.00000000"),
+        initial_holdings=Decimal("10.00000000"),
+    )
+
+    async def mock_get_wallet(uid, session):
+        await tx_state.acquire_lock(session)
+        wallet.balance = tx_state.balance
+        return wallet
+
+    async def mock_update_balance(w, new_bal):
+        tx_state.balance = new_bal
+        w.balance = new_bal
+        return w
+
+    async def mock_get_holdings(wid, aid, session):
+        return tx_state.holdings
+
+    async def mock_create_tx(tx, session):
+        if tx.transaction_type == "SELL":
+            tx_state.holdings -= tx.quantity
+        tx_state.transactions.append(tx)
+        return tx
+
+    wallet_repo = MagicMock()
+    wallet_repo.get_wallet_for_user_update = AsyncMock(side_effect=mock_get_wallet)
+    wallet_repo.update_balance = AsyncMock(side_effect=mock_update_balance)
+
+    trading_repo = MagicMock()
+    trading_repo.get_asset_by_id = AsyncMock(return_value=asset)
+    trading_repo.get_net_holdings = AsyncMock(side_effect=mock_get_holdings)
+    trading_repo.create_transaction = AsyncMock(side_effect=mock_create_tx)
+
+    service = TradingService(
+        wallet_repo=wallet_repo,
+        trading_repo=trading_repo,
+    )
+
+    ready_event = asyncio.Event()
+    counter_lock = asyncio.Lock()
+    ready_count = 0
+
+    async def sync():
+        nonlocal ready_count
+        async with counter_lock:
+            ready_count += 1
+            if ready_count == 2:
+                ready_event.set()
+        await asyncio.wait_for(ready_event.wait(), timeout=2.0)
+
+    async def run_sell():
+        await sync()
+        return await service.execute_sell(
+            user_id=user_id,
+            asset_id=asset_id,
+            quantity=Decimal("8.00000000"),
+            price=Decimal("100.00000000"),
+            session=tx_state.create_session(wallet),
+        )
+
+    results = await asyncio.wait_for(
+        asyncio.gather(run_sell(), run_sell(), return_exceptions=True),
+        timeout=5.0,
+    )
+
+    successes = [r for r in results if isinstance(r, Transaction)]
+    failures = [r for r in results if isinstance(r, InsufficientHoldingsError)]
+
+    assert len(successes) == 1
+    assert len(failures) == 1
+    # 8 of 10 holdings sold; remaining must be 2; failed SELL rolled back
+    assert tx_state.holdings == Decimal("2.00000000")
+    # Initial $1000 + $800 proceeds = $1800
+    assert wallet.balance == Decimal("1800.00000000")
+    assert tx_state.balance == Decimal("1800.00000000")
+    assert len(tx_state.transactions) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_buy_and_sell_preserves_balance_and_ledger_at_service_boundary():
+    """Verify concurrent BUY and SELL preserve balance and ledger consistency.
+
+    Demonstrates that regardless of which operation acquires the lock first,
+    the shared wallet balance and holdings remain consistent:
+    - Path A (BUY then SELL): $1000 - $200 = $800, then $800 + $450 = $1250; holdings: 10 + 2 - 3 = 9.
+    - Path B (SELL then BUY): $1000 + $450 = $1450, then $1450 - $200 = $1250; holdings: 10 - 3 + 2 = 9.
+    """
+    user_id = uuid4()
+    asset_id = uuid4()
+
+    wallet = MagicMock()
+    wallet.id = uuid4()
+    wallet.user_id = user_id
+    wallet.balance = Decimal("1000.00000000")
+    wallet.currency = "USD"
+
+    asset = MagicMock(spec=Asset)
+    asset.id = asset_id
+    asset.currency = "USD"
+    asset.is_active = True
+
+    tx_state = MockTransactionalState(
+        initial_balance=Decimal("1000.00000000"),
+        initial_holdings=Decimal("10.00000000"),
+    )
+
+    async def mock_get_wallet(uid, session):
+        await tx_state.acquire_lock(session)
+        wallet.balance = tx_state.balance
+        return wallet
+
+    async def mock_update_balance(w, new_bal):
+        tx_state.balance = new_bal
+        w.balance = new_bal
+        return w
+
+    async def mock_get_holdings(wid, aid, session):
+        return tx_state.holdings
+
+    async def mock_create_tx(tx, session):
+        if tx.transaction_type == "BUY":
+            tx_state.holdings += tx.quantity
+        elif tx.transaction_type == "SELL":
+            tx_state.holdings -= tx.quantity
+        tx_state.transactions.append(tx)
+        return tx
+
+    wallet_repo = MagicMock()
+    wallet_repo.get_wallet_for_user_update = AsyncMock(side_effect=mock_get_wallet)
+    wallet_repo.update_balance = AsyncMock(side_effect=mock_update_balance)
+
+    trading_repo = MagicMock()
+    trading_repo.get_asset_by_id = AsyncMock(return_value=asset)
+    trading_repo.get_net_holdings = AsyncMock(side_effect=mock_get_holdings)
+    trading_repo.create_transaction = AsyncMock(side_effect=mock_create_tx)
+
+    service = TradingService(
+        wallet_repo=wallet_repo,
+        trading_repo=trading_repo,
+    )
+
+    ready_event = asyncio.Event()
+    counter_lock = asyncio.Lock()
+    ready_count = 0
+
+    async def sync():
+        nonlocal ready_count
+        async with counter_lock:
+            ready_count += 1
+            if ready_count == 2:
+                ready_event.set()
+        await asyncio.wait_for(ready_event.wait(), timeout=2.0)
+
+    async def run_buy():
+        await sync()
+        return await service.execute_buy(
+            user_id=user_id,
+            asset_id=asset_id,
+            quantity=Decimal("2.00000000"),
+            price=Decimal("100.00000000"),
+            session=tx_state.create_session(wallet),
+        )
+
+    async def run_sell():
+        await sync()
+        return await service.execute_sell(
+            user_id=user_id,
+            asset_id=asset_id,
+            quantity=Decimal("3.00000000"),
+            price=Decimal("150.00000000"),
+            session=tx_state.create_session(wallet),
+        )
+
+    results = await asyncio.wait_for(
+        asyncio.gather(run_buy(), run_sell(), return_exceptions=True),
+        timeout=5.0,
+    )
+
+    assert len(results) == 2
+    for r in results:
+        assert isinstance(r, Transaction)
+
+    # Initial $1,000 - $200 (BUY: 2 @ 100) + $450 (SELL: 3 @ 150) = $1,250
+    assert wallet.balance == Decimal("1250.00000000")
+    assert tx_state.balance == Decimal("1250.00000000")
+    # Initial 10 + 2 (BUY) - 3 (SELL) = 9
+    assert tx_state.holdings == Decimal("9.00000000")
+    assert len(tx_state.transactions) == 2
+    assert {tx.transaction_type for tx in tx_state.transactions} == {
+        "BUY",
+        "SELL",
+    }
+
+
+@pytest.mark.asyncio
+async def test_mock_transactional_state_rollback_and_lock_release_on_exception():
+    """Verify MockTransactionalState rolls back state and releases lock on failure.
+
+    Ensures:
+    1. Lock ownership is tracked per transaction (lock released only if acquired).
+    2. Exceptions inside an active transaction restore balance, holdings, and transactions.
+    3. Cancellation unwinding safely releases the held lock and restores state.
+    4. Pre-lock failures do not attempt to release or corrupt state.
+    """
+    tx_state = MockTransactionalState(
+        initial_balance=Decimal("1000.00000000"),
+        initial_holdings=Decimal("10.00000000"),
+    )
+    wallet = MagicMock()
+    wallet.balance = Decimal("1000.00000000")
+
+    session = tx_state.create_session(wallet)
+
+    # 1. Normal failure after lock acquisition: state is rolled back and lock is released
+    with pytest.raises(RuntimeError, match="Simulated failure inside transaction"):
+        async with session.begin():
+            await tx_state.acquire_lock(session)
+            assert session.tx_context.has_lock is True
+            assert tx_state.lock.locked() is True
+
+            # Mutate state within transaction
+            tx_state.balance = Decimal("500.00000000")
+            wallet.balance = Decimal("500.00000000")
+            tx_state.holdings = Decimal("5.00000000")
+            tx_state.transactions.append(MagicMock())
+
+            raise RuntimeError("Simulated failure inside transaction")
+
+    # Verify rollback
+    assert tx_state.balance == Decimal("1000.00000000")
+    assert wallet.balance == Decimal("1000.00000000")
+    assert tx_state.holdings == Decimal("10.00000000")
+    assert len(tx_state.transactions) == 0
+    # Verify lock released
+    assert not tx_state.lock.locked()
+    assert session.tx_context.has_lock is False
+
+    # 2. Failure before lock acquisition: does not touch or release an unacquired lock
+    session2 = tx_state.create_session(wallet)
+    with pytest.raises(ValueError, match="Pre-lock validation failure"):
+        async with session2.begin():
+            assert session2.tx_context.has_lock is False
+            raise ValueError("Pre-lock validation failure")
+
+    assert session2.tx_context.has_lock is False
+    assert not tx_state.lock.locked()
+
+    # 3. Cancellation after lock acquisition: lock is released and state rolled back
+    session3 = tx_state.create_session(wallet)
+    with pytest.raises(asyncio.CancelledError):
+        async with session3.begin():
+            await tx_state.acquire_lock(session3)
+            assert session3.tx_context.has_lock is True
+            assert tx_state.lock.locked() is True
+
+            tx_state.balance = Decimal("200.00000000")
+            wallet.balance = Decimal("200.00000000")
+            raise asyncio.CancelledError()
+
+    assert tx_state.balance == Decimal("1000.00000000")
+    assert wallet.balance == Decimal("1000.00000000")
+    assert not tx_state.lock.locked()
+    assert session3.tx_context.has_lock is False
+
+    # 4. Attempting to acquire lock without active transaction context raises RuntimeError
+    session4 = tx_state.create_session(wallet)
+    with pytest.raises(
+        RuntimeError,
+        match="Cannot acquire lock without an active transaction context on session",
+    ):
+        await tx_state.acquire_lock(session4)
