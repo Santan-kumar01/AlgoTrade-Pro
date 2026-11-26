@@ -1,7 +1,8 @@
-﻿from decimal import Decimal
+﻿from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models import Asset, Transaction
@@ -119,3 +120,132 @@ class TradingRepository:
 
         result = await session.execute(statement)
         return list(result.scalars().all())
+
+    async def get_transaction_history(
+        self,
+        wallet_id: UUID,
+        session: AsyncSession,
+        *,
+        asset_id: UUID | None = None,
+        transaction_type: str | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[tuple[Transaction, Asset]]:
+        """Retrieve paginated transaction records joined with asset details in descending order."""
+        statement = (
+            select(Transaction, Asset)
+            .join(Asset, Transaction.asset_id == Asset.id)
+            .where(Transaction.wallet_id == wallet_id)
+        )
+
+        if asset_id is not None:
+            statement = statement.where(Transaction.asset_id == asset_id)
+
+        if transaction_type is not None:
+            statement = statement.where(
+                Transaction.transaction_type == transaction_type.upper()
+            )
+
+        if start_at is not None:
+            statement = statement.where(Transaction.created_at >= start_at)
+
+        if end_at is not None:
+            statement = statement.where(Transaction.created_at <= end_at)
+
+        statement = (
+            statement.order_by(
+                Transaction.created_at.desc(),
+                Transaction.id.desc(),
+            )
+            .limit(limit)
+            .offset(offset)
+        )
+
+        result = await session.execute(statement)
+        return list(result.tuples().all())
+
+    async def count_transaction_history(
+        self,
+        wallet_id: UUID,
+        session: AsyncSession,
+        *,
+        asset_id: UUID | None = None,
+        transaction_type: str | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+    ) -> int:
+        """Count total transactions matching the specified criteria for pagination."""
+        statement = (
+            select(func.count(Transaction.id))
+            .where(Transaction.wallet_id == wallet_id)
+        )
+
+        if asset_id is not None:
+            statement = statement.where(Transaction.asset_id == asset_id)
+
+        if transaction_type is not None:
+            statement = statement.where(
+                Transaction.transaction_type == transaction_type.upper()
+            )
+
+        if start_at is not None:
+            statement = statement.where(Transaction.created_at >= start_at)
+
+        if end_at is not None:
+            statement = statement.where(Transaction.created_at <= end_at)
+
+        result = await session.execute(statement)
+        return result.scalar_one() or 0
+
+    async def get_transaction_by_id(
+        self,
+        transaction_id: UUID,
+        wallet_id: UUID,
+        session: AsyncSession,
+    ) -> tuple[Transaction, Asset] | None:
+        """Retrieve a single transaction with its asset metadata by ID and wallet ID."""
+        statement = (
+            select(Transaction, Asset)
+            .join(Asset, Transaction.asset_id == Asset.id)
+            .where(
+                Transaction.id == transaction_id,
+                Transaction.wallet_id == wallet_id,
+            )
+        )
+        result = await session.execute(statement)
+        row = result.tuples().first()
+        return row if row is not None else None
+
+    async def get_all_net_holdings(
+        self,
+        wallet_id: UUID,
+        session: AsyncSession,
+    ) -> dict[UUID, Decimal]:
+        """Aggregate net positive holdings across all assets for a wallet in SQL."""
+        statement = (
+            select(
+                Transaction.asset_id,
+                func.sum(
+                    case(
+                        (Transaction.transaction_type == "BUY", Transaction.quantity),
+                        (Transaction.transaction_type == "SELL", -Transaction.quantity),
+                        else_=Decimal("0"),
+                    )
+                ).label("net_quantity"),
+            )
+            .where(Transaction.wallet_id == wallet_id)
+            .group_by(Transaction.asset_id)
+            .having(
+                func.sum(
+                    case(
+                        (Transaction.transaction_type == "BUY", Transaction.quantity),
+                        (Transaction.transaction_type == "SELL", -Transaction.quantity),
+                        else_=Decimal("0"),
+                    )
+                ) > Decimal("0")
+            )
+        )
+        result = await session.execute(statement)
+        return {asset_id: net_qty for asset_id, net_qty in result.tuples().all()}

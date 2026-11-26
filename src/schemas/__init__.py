@@ -17,6 +17,8 @@ from src.schemas.portfolio import (
 from src.schemas.trading import (
     BuyOrderRequest,
     SellOrderRequest,
+    TradeHistoryItemResponse,
+    TradeHistoryResponse,
     TradeResponse,
     TradeType,
 )
@@ -34,6 +36,8 @@ __all__ = [
     "PortfolioSnapshotResponse",
     "SellOrderRequest",
     "TokenResponse",
+    "TradeHistoryItemResponse",
+    "TradeHistoryResponse",
     "TradeResponse",
     "TradeType",
     "UserLogin",

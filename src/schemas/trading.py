@@ -110,3 +110,32 @@ class TradeResponse(BaseModel):
     price: Decimal
     total_amount: Decimal
     created_at: datetime
+
+
+class TradeHistoryItemResponse(BaseModel):
+    """Schema representing an individual trade record in transaction history with asset metadata."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    wallet_id: UUID
+    asset_id: UUID
+    symbol: str
+    asset_name: str
+    transaction_type: TradeType
+    quantity: Decimal
+    price: Decimal
+    total_amount: Decimal
+    currency: str
+    created_at: datetime
+
+
+class TradeHistoryResponse(BaseModel):
+    """Paginated trade transaction history response."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    total: int
+    limit: int
+    offset: int
+    items: list[TradeHistoryItemResponse]

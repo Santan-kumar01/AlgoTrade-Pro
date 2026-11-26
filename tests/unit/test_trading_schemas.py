@@ -10,12 +10,16 @@ from src.models.transaction import Transaction
 from src.schemas import (
     BuyOrderRequest,
     SellOrderRequest,
+    TradeHistoryItemResponse,
+    TradeHistoryResponse,
     TradeResponse,
     TradeType,
 )
 from src.schemas.trading import (
     BuyOrderRequest as DirectBuyOrderRequest,
     SellOrderRequest as DirectSellOrderRequest,
+    TradeHistoryItemResponse as DirectTradeHistoryItemResponse,
+    TradeHistoryResponse as DirectTradeHistoryResponse,
     TradeResponse as DirectTradeResponse,
     TradeType as DirectTradeType,
     validate_decimal_precision,
@@ -1265,3 +1269,63 @@ def test_orders_accept_uuid_format_variations():
         price=Decimal("20"),
     )
     assert sell_hex.asset_id == expected_uuid
+
+
+def test_trade_history_item_response_instantiation():
+    """Verify TradeHistoryItemResponse parses and holds valid trade history data."""
+    item_id = uuid.uuid4()
+    wallet_id = uuid.uuid4()
+    asset_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+
+    item = TradeHistoryItemResponse(
+        id=item_id,
+        wallet_id=wallet_id,
+        asset_id=asset_id,
+        symbol="AAPL",
+        asset_name="Apple Inc.",
+        transaction_type=TradeType.BUY,
+        quantity=Decimal("10.00000000"),
+        price=Decimal("150.00000000"),
+        total_amount=Decimal("1500.00000000"),
+        currency="USD",
+        created_at=now,
+    )
+
+    assert item.id == item_id
+    assert item.symbol == "AAPL"
+    assert item.asset_name == "Apple Inc."
+    assert item.transaction_type == TradeType.BUY
+    assert item.quantity == Decimal("10.00000000")
+    assert item.currency == "USD"
+    assert item.created_at == now
+
+
+def test_trade_history_response_pagination():
+    """Verify TradeHistoryResponse paginated collection structure."""
+    item = TradeHistoryItemResponse(
+        id=uuid.uuid4(),
+        wallet_id=uuid.uuid4(),
+        asset_id=uuid.uuid4(),
+        symbol="BTC",
+        asset_name="Bitcoin",
+        transaction_type=TradeType.SELL,
+        quantity=Decimal("1.50000000"),
+        price=Decimal("60000.00000000"),
+        total_amount=Decimal("90000.00000000"),
+        currency="USD",
+        created_at=datetime.now(timezone.utc),
+    )
+
+    history = TradeHistoryResponse(
+        total=1,
+        limit=50,
+        offset=0,
+        items=[item],
+    )
+
+    assert history.total == 1
+    assert history.limit == 50
+    assert history.offset == 0
+    assert len(history.items) == 1
+    assert history.items[0].symbol == "BTC"

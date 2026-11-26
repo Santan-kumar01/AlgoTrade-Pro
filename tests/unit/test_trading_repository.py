@@ -221,3 +221,144 @@ async def test_get_assets_by_ids_returns_empty_without_database_query():
     assert returned_assets == []
     session.execute.assert_not_awaited()
 
+
+@pytest.mark.asyncio
+async def test_get_transaction_history_with_filters_and_pagination():
+    wallet_id = uuid4()
+    asset_id = uuid4()
+    asset = Asset(
+        id=asset_id,
+        symbol="AAPL",
+        name="Apple Inc.",
+        asset_type="STOCK",
+        currency="USD",
+        is_active=True,
+    )
+    transaction = Transaction(
+        wallet_id=wallet_id,
+        asset_id=asset_id,
+        transaction_type="BUY",
+        quantity=Decimal("10.00000000"),
+        price=Decimal("150.00000000"),
+        total_amount=Decimal("1500.00000000"),
+    )
+
+    session = MagicMock()
+    result = MagicMock()
+    result.tuples.return_value.all.return_value = [(transaction, asset)]
+    session.execute = AsyncMock(return_value=result)
+
+    repository = TradingRepository()
+    rows = await repository.get_transaction_history(
+        wallet_id=wallet_id,
+        session=session,
+        asset_id=asset_id,
+        transaction_type="BUY",
+        limit=10,
+        offset=0,
+    )
+
+    assert len(rows) == 1
+    assert rows[0] == (transaction, asset)
+    session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_count_transaction_history_with_filters():
+    wallet_id = uuid4()
+    session = MagicMock()
+    result = MagicMock()
+    result.scalar_one.return_value = 42
+    session.execute = AsyncMock(return_value=result)
+
+    repository = TradingRepository()
+    count = await repository.count_transaction_history(
+        wallet_id=wallet_id,
+        session=session,
+        transaction_type="SELL",
+    )
+
+    assert count == 42
+    session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_transaction_by_id_returns_matching_row():
+    tx_id = uuid4()
+    wallet_id = uuid4()
+    asset_id = uuid4()
+    asset = Asset(
+        id=asset_id,
+        symbol="BTC",
+        name="Bitcoin",
+        asset_type="CRYPTO",
+        currency="USD",
+        is_active=True,
+    )
+    transaction = Transaction(
+        id=tx_id,
+        wallet_id=wallet_id,
+        asset_id=asset_id,
+        transaction_type="BUY",
+        quantity=Decimal("1.00000000"),
+        price=Decimal("50000.00000000"),
+        total_amount=Decimal("50000.00000000"),
+    )
+
+    session = MagicMock()
+    result = MagicMock()
+    result.tuples.return_value.first.return_value = (transaction, asset)
+    session.execute = AsyncMock(return_value=result)
+
+    repository = TradingRepository()
+    row = await repository.get_transaction_by_id(
+        transaction_id=tx_id,
+        wallet_id=wallet_id,
+        session=session,
+    )
+
+    assert row == (transaction, asset)
+    session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_transaction_by_id_returns_none_when_not_found():
+    session = MagicMock()
+    result = MagicMock()
+    result.tuples.return_value.first.return_value = None
+    session.execute = AsyncMock(return_value=result)
+
+    repository = TradingRepository()
+    row = await repository.get_transaction_by_id(
+        transaction_id=uuid4(),
+        wallet_id=uuid4(),
+        session=session,
+    )
+
+    assert row is None
+    session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_all_net_holdings_aggregates_positive_balances():
+    wallet_id = uuid4()
+    asset1_id = uuid4()
+    asset2_id = uuid4()
+
+    session = MagicMock()
+    result = MagicMock()
+    result.tuples.return_value.all.return_value = [
+        (asset1_id, Decimal("10.00000000")),
+        (asset2_id, Decimal("5.50000000")),
+    ]
+    session.execute = AsyncMock(return_value=result)
+
+    repository = TradingRepository()
+    holdings = await repository.get_all_net_holdings(wallet_id, session)
+
+    assert holdings == {
+        asset1_id: Decimal("10.00000000"),
+        asset2_id: Decimal("5.50000000"),
+    }
+    session.execute.assert_awaited_once()
+
