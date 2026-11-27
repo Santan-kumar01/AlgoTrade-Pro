@@ -112,6 +112,9 @@ class PortfolioAnalyticsResponse(BaseModel):
     concentration_threshold: Decimal = Decimal("50")
     is_concentrated: bool | None = None
     concentrated_positions: tuple[str, ...] = ()
+    risk_score: Decimal | None = None
+    risk_level: str | None = None
+    risk_factors: tuple[str, ...] = ()
 
 
 class PortfolioSnapshotResponse(BaseModel):

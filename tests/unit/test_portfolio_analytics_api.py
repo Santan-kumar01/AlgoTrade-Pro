@@ -69,6 +69,9 @@ async def test_authenticated_user_can_retrieve_portfolio_analytics(
         concentration_threshold=Decimal("50"),
         is_concentrated=True,
         concentrated_positions=("AAPL",),
+        risk_score=Decimal("100"),
+        risk_level="HIGH",
+        risk_factors=("AAPL represents 100% of portfolio value.",),
     )
 
     mock_db = AsyncMock()
@@ -132,6 +135,11 @@ async def test_authenticated_user_can_retrieve_portfolio_analytics(
         assert data["concentration_threshold"] == "50"
         assert data["is_concentrated"] is True
         assert data["concentrated_positions"] == ["AAPL"]
+        assert data["risk_score"] == "100"
+        assert data["risk_level"] == "HIGH"
+        assert data["risk_factors"] == [
+            "AAPL represents 100% of portfolio value."
+        ]
 
         mock_wallet_repository.get_wallet_by_user_id.assert_awaited_once_with(
             user_id,

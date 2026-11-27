@@ -321,6 +321,9 @@ async def test_analytics_preserves_realized_pnl_without_open_positions():
     assert currency.realized_pnl == Decimal("75")
     assert currency.unrealized_pnl == Decimal("0")
     assert currency.total_pnl == Decimal("75")
+    assert result.risk_score is None
+    assert result.risk_level is None
+    assert result.risk_factors == ()
 
 
 @pytest.mark.asyncio
@@ -527,6 +530,9 @@ async def test_analytics_disables_global_concentration_for_multiple_currencies()
     assert result.concentration_ratio is None
     assert result.is_concentrated is None
     assert result.concentrated_positions == ()
+    assert result.risk_score is None
+    assert result.risk_level is None
+    assert result.risk_factors == ()
 
 
 @pytest.mark.asyncio
@@ -570,3 +576,63 @@ async def test_analytics_calculates_negative_unrealized_pnl():
     assert position.total_pnl == Decimal("-90")
 
     assert currency.total_pnl == Decimal("-90")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("market_values", "expected_score", "expected_level"),
+    [
+        ((20, 20, 20, 20, 20), Decimal("20"), "LOW"),
+        ((25, 25, 25, 25), Decimal("25"), "MEDIUM"),
+        ((50, 50), Decimal("50"), "HIGH"),
+        ((70, 30), Decimal("70"), "HIGH"),
+    ],
+)
+async def test_analytics_classifies_portfolio_risk(
+    market_values,
+    expected_score,
+    expected_level,
+):
+    wallet_id = uuid4()
+    asset_ids = tuple(uuid4() for _ in market_values)
+
+    positions = tuple(
+        PortfolioPosition(
+            asset_id=asset_id,
+            symbol=f"ASSET{index}",
+            name=f"Asset {index}",
+            asset_type="CRYPTO",
+            currency="USD",
+            quantity=Decimal("1"),
+            average_cost=Decimal(str(value)),
+            total_invested=Decimal(str(value)),
+            realized_pnl=Decimal("0"),
+        )
+        for index, (asset_id, value) in enumerate(zip(asset_ids, market_values))
+    )
+
+    portfolio_service = AsyncMock()
+    portfolio_service.get_portfolio.return_value = PortfolioSummary(
+        wallet_id=wallet_id,
+        positions=positions,
+        realized_pnl_by_currency={"USD": Decimal("0")},
+    )
+
+    service = PortfolioAnalyticsService(portfolio_service)
+    result = await service.get_analytics(
+        wallet_id,
+        {
+            asset_id: Decimal(str(value))
+            for asset_id, value in zip(asset_ids, market_values)
+        },
+        AsyncMock(),
+    )
+
+    assert result.risk_score == expected_score
+    assert result.risk_level == expected_level
+
+    if expected_level == "LOW":
+        assert result.risk_factors == ()
+    else:
+        assert len(result.risk_factors) == 1
+        assert "ASSET" in result.risk_factors[0]
