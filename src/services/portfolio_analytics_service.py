@@ -42,6 +42,9 @@ class PortfolioAnalytics:
     concentration_threshold: Decimal = Decimal("50")
     is_concentrated: bool | None = None
     concentrated_positions: tuple[str, ...] = ()
+    risk_score: Decimal | None = None
+    risk_level: str | None = None
+    risk_factors: tuple[str, ...] = ()
 
 
 class MarketPriceValidationError(ValueError):
@@ -212,6 +215,30 @@ class PortfolioAnalyticsService:
                 )
                 is_concentrated = concentration_ratio >= self.concentration_threshold
 
+            risk_score = None
+            risk_level = None
+            risk_factors = ()
+
+            if concentration_ratio is not None and position_results:
+                risk_score = concentration_ratio
+                highest_position = max(
+                    position_results,
+                    key=lambda position: position.allocation_percentage,
+                )
+
+                if risk_score < Decimal("25"):
+                    risk_level = "LOW"
+                elif risk_score < Decimal("50"):
+                    risk_level = "MEDIUM"
+                else:
+                    risk_level = "HIGH"
+
+                if risk_level != "LOW":
+                    risk_factors = (
+                        f"{highest_position.symbol} represents "
+                        f"{risk_score}% of portfolio value.",
+                    )
+
             currency_results = []
 
             for currency in sorted(currency_totals):
@@ -237,4 +264,7 @@ class PortfolioAnalyticsService:
             concentration_threshold=self.concentration_threshold,
             is_concentrated=is_concentrated,
             concentrated_positions=concentrated_positions,
+            risk_score=risk_score,
+            risk_level=risk_level,
+            risk_factors=risk_factors,
         )
