@@ -792,3 +792,115 @@ async def test_sell_rollback_on_ledger_failure_preserves_wallet_and_holdings(
         assert transactions[0].quantity == Decimal("10.00000000")
         assert transactions[0].price == Decimal("100.00000000")
         assert transactions[0].total_amount == Decimal("1000.00000000")
+
+
+@pytest.mark.asyncio
+async def test_buy_sell_history_and_holdings_lifecycle(
+    db_session_factory,
+    trading_user,
+    trading_asset,
+):
+    """Verify complete trading lifecycle: BUY -> SELL -> history pagination -> net holdings."""
+    user, wallet = trading_user
+    service = TradingService()
+    trading_repo = TradingRepository()
+
+    # Step 1: BUY 5 units at $100 ($500 cost)
+    async with db_session_factory() as session:
+        buy_tx = await service.execute_buy(
+            user_id=user.id,
+            asset_id=trading_asset.id,
+            quantity=Decimal("5.00000000"),
+            price=Decimal("100.00000000"),
+            session=session,
+        )
+        assert buy_tx.transaction_type == "BUY"
+        assert buy_tx.quantity == Decimal("5.00000000")
+        assert buy_tx.total_amount == Decimal("500.00000000")
+
+    # Step 2: SELL 2 units at $120 ($240 proceeds)
+    async with db_session_factory() as session:
+        sell_tx = await service.execute_sell(
+            user_id=user.id,
+            asset_id=trading_asset.id,
+            quantity=Decimal("2.00000000"),
+            price=Decimal("120.00000000"),
+            session=session,
+        )
+        assert sell_tx.transaction_type == "SELL"
+        assert sell_tx.quantity == Decimal("2.00000000")
+        assert sell_tx.total_amount == Decimal("240.00000000")
+
+    # Step 3: Verify wallet balance, transaction history, and net holdings in an independent session
+    async with db_session_factory() as verification_session:
+        # Initial $10,000 - $500 + $240 = $9,740
+        updated_wallet = await verification_session.get(Wallet, wallet.id)
+        assert updated_wallet is not None
+        assert updated_wallet.balance == Decimal("9740.00000000")
+
+        # Net holdings derived in SQL
+        holdings = await trading_repo.get_all_net_holdings(
+            wallet.id,
+            verification_session,
+        )
+        assert holdings == {trading_asset.id: Decimal("3.00000000")}
+
+        # Single asset net holdings
+        single_holding = await trading_repo.get_net_holdings(
+            wallet.id,
+            trading_asset.id,
+            verification_session,
+        )
+        assert single_holding == Decimal("3.00000000")
+
+        # History pagination (limit=1, offset=0 returns the most recent transaction: SELL)
+        page1 = await trading_repo.get_transaction_history(
+            wallet.id,
+            verification_session,
+            limit=1,
+            offset=0,
+        )
+        assert len(page1) == 1
+        tx1, asset1 = page1[0]
+        assert tx1.id == sell_tx.id
+        assert tx1.transaction_type == "SELL"
+        assert asset1.id == trading_asset.id
+        assert asset1.symbol == trading_asset.symbol
+
+        # History pagination (limit=1, offset=1 returns the older transaction: BUY)
+        page2 = await trading_repo.get_transaction_history(
+            wallet.id,
+            verification_session,
+            limit=1,
+            offset=1,
+        )
+        assert len(page2) == 1
+        tx2, asset2 = page2[0]
+        assert tx2.id == buy_tx.id
+        assert tx2.transaction_type == "BUY"
+        assert asset2.id == trading_asset.id
+
+        # Total history count
+        total_history = await trading_repo.count_transaction_history(
+            wallet.id,
+            verification_session,
+        )
+        assert total_history == 2
+
+        # Filter history by transaction_type=BUY
+        buy_history = await trading_repo.get_transaction_history(
+            wallet.id,
+            verification_session,
+            transaction_type="BUY",
+        )
+        assert len(buy_history) == 1
+        assert buy_history[0][0].id == buy_tx.id
+
+        # Filter history by transaction_type=SELL
+        sell_history = await trading_repo.get_transaction_history(
+            wallet.id,
+            verification_session,
+            transaction_type="SELL",
+        )
+        assert len(sell_history) == 1
+        assert sell_history[0][0].id == sell_tx.id

@@ -2279,3 +2279,86 @@ async def test_get_user_holdings_wallet_not_found(trading_setup):
             session=setup["session"],
         )
     assert exc_info.value.user_id == setup["user_id"]
+
+
+@pytest.mark.asyncio
+async def test_trading_service_complete_lifecycle(trading_setup):
+    """Verify complete TradingService lifecycle: buy -> sell -> history -> holdings -> get_by_id."""
+    setup = trading_setup
+    now = datetime.now(timezone.utc)
+    user_id = setup["user_id"]
+    wallet = setup["wallet"]
+    asset = Asset(
+        id=setup["asset_id"],
+        symbol="BTC",
+        name="Bitcoin",
+        currency="USD",
+        is_active=True,
+    )
+    wallet.balance = Decimal("10000.00000000")
+
+    # 1. Execute BUY
+    buy_tx = await setup["service"].execute_buy(
+        user_id=user_id,
+        asset_id=asset.id,
+        quantity=Decimal("5.00000000"),
+        price=Decimal("100.00000000"),
+        session=setup["session"],
+    )
+    assert buy_tx.transaction_type == "BUY"
+    assert buy_tx.quantity == Decimal("5.00000000")
+    assert buy_tx.total_amount == Decimal("500.00000000")
+
+    # 2. Execute SELL
+    setup["trading_repo"].get_net_holdings = AsyncMock(return_value=Decimal("5.00000000"))
+    sell_tx = await setup["service"].execute_sell(
+        user_id=user_id,
+        asset_id=asset.id,
+        quantity=Decimal("2.00000000"),
+        price=Decimal("120.00000000"),
+        session=setup["session"],
+    )
+    assert sell_tx.transaction_type == "SELL"
+    assert sell_tx.quantity == Decimal("2.00000000")
+    assert sell_tx.total_amount == Decimal("240.00000000")
+
+    # Simulate database column defaults populated on flush/commit
+    buy_tx.id = uuid4()
+    buy_tx.created_at = now
+    sell_tx.id = uuid4()
+    sell_tx.created_at = now
+
+    # 3. Query History
+    setup["wallet_repo"].get_wallet_by_user_id = AsyncMock(return_value=wallet)
+    setup["trading_repo"].get_transaction_history = AsyncMock(return_value=[(sell_tx, asset), (buy_tx, asset)])
+    setup["trading_repo"].count_transaction_history = AsyncMock(return_value=2)
+
+    history = await setup["service"].get_transaction_history(
+        user_id=user_id,
+        session=setup["session"],
+        limit=50,
+        offset=0,
+    )
+    assert history.total == 2
+    assert len(history.items) == 2
+    assert history.items[0].transaction_type == TradeType.SELL
+    assert history.items[1].transaction_type == TradeType.BUY
+
+    # 4. Query Holdings
+    setup["trading_repo"].get_all_net_holdings = AsyncMock(return_value={asset.id: Decimal("3.00000000")})
+    holdings = await setup["service"].get_user_holdings(
+        user_id=user_id,
+        session=setup["session"],
+    )
+    assert holdings == {asset.id: Decimal("3.00000000")}
+
+    # 5. Query Transaction By ID
+    setup["trading_repo"].get_transaction_by_id = AsyncMock(return_value=(buy_tx, asset))
+    item = await setup["service"].get_transaction_by_id(
+        transaction_id=buy_tx.id,
+        user_id=user_id,
+        session=setup["session"],
+    )
+    assert item.id == buy_tx.id
+    assert item.transaction_type == TradeType.BUY
+    assert item.symbol == "BTC"

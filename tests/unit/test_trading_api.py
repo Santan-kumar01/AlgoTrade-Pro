@@ -971,3 +971,217 @@ def test_history_and_holdings_routes_registered():
     assert "get" in paths["/api/v1/trades/holdings"]
     assert "/api/v1/trades/{transaction_id}" in paths
     assert "get" in paths["/api/v1/trades/{transaction_id}"]
+
+
+@pytest.mark.asyncio
+async def test_trading_api_complete_lifecycle(api_setup):
+    """Verify complete HTTP API lifecycle: BUY -> SELL -> History -> Holdings -> Details."""
+    setup = api_setup
+    now = datetime.now(timezone.utc)
+    buy_tx_id = uuid4()
+    sell_tx_id = uuid4()
+
+    buy_tx = Transaction(
+        id=buy_tx_id,
+        wallet_id=setup["wallet_id"],
+        asset_id=setup["asset_id"],
+        transaction_type="BUY",
+        quantity=Decimal("10.00000000"),
+        price=Decimal("100.00000000"),
+        total_amount=Decimal("1000.00000000"),
+        created_at=now,
+    )
+    sell_tx = Transaction(
+        id=sell_tx_id,
+        wallet_id=setup["wallet_id"],
+        asset_id=setup["asset_id"],
+        transaction_type="SELL",
+        quantity=Decimal("4.00000000"),
+        price=Decimal("150.00000000"),
+        total_amount=Decimal("600.00000000"),
+        created_at=now,
+    )
+
+    setup["mock_service"].execute_buy.return_value = buy_tx
+    setup["mock_service"].execute_sell.return_value = sell_tx
+
+    history_items = [
+        TradeHistoryItemResponse(
+            id=sell_tx_id,
+            wallet_id=setup["wallet_id"],
+            asset_id=setup["asset_id"],
+            symbol="BTC",
+            asset_name="Bitcoin",
+            transaction_type=TradeType.SELL,
+            quantity=Decimal("4.00000000"),
+            price=Decimal("150.00000000"),
+            total_amount=Decimal("600.00000000"),
+            currency="USD",
+            created_at=now,
+        ),
+        TradeHistoryItemResponse(
+            id=buy_tx_id,
+            wallet_id=setup["wallet_id"],
+            asset_id=setup["asset_id"],
+            symbol="BTC",
+            asset_name="Bitcoin",
+            transaction_type=TradeType.BUY,
+            quantity=Decimal("10.00000000"),
+            price=Decimal("100.00000000"),
+            total_amount=Decimal("1000.00000000"),
+            currency="USD",
+            created_at=now,
+        ),
+    ]
+    setup["mock_service"].get_transaction_history.return_value = TradeHistoryResponse(
+        total=2,
+        limit=50,
+        offset=0,
+        items=history_items,
+    )
+    setup["mock_service"].get_user_holdings.return_value = {
+        setup["asset_id"]: Decimal("6.00000000")
+    }
+
+    async def mock_get_by_id(transaction_id, user_id, session):
+        if transaction_id == sell_tx_id:
+            return history_items[0]
+        return history_items[1]
+
+    setup["mock_service"].get_transaction_by_id.side_effect = mock_get_by_id
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        # 1. Execute BUY
+        buy_res = await client.post(
+            "/api/v1/trades/buy",
+            json={
+                "asset_id": str(setup["asset_id"]),
+                "quantity": "10.00000000",
+                "price": "100.00000000",
+            },
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+        assert buy_res.status_code == 201
+        assert buy_res.json()["transaction_type"] == "BUY"
+        assert buy_res.json()["total_amount"] == "1000.00000000"
+
+        # 2. Execute SELL
+        sell_res = await client.post(
+            "/api/v1/trades/sell",
+            json={
+                "asset_id": str(setup["asset_id"]),
+                "quantity": "4.00000000",
+                "price": "150.00000000",
+            },
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+        assert sell_res.status_code == 201
+        assert sell_res.json()["transaction_type"] == "SELL"
+        assert sell_res.json()["total_amount"] == "600.00000000"
+
+        # 3. Query History
+        hist_res = await client.get(
+            "/api/v1/trades/history",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+        assert hist_res.status_code == 200
+        hist_data = hist_res.json()
+        assert hist_data["total"] == 2
+        assert len(hist_data["items"]) == 2
+        assert hist_data["items"][0]["transaction_type"] == "SELL"
+        assert hist_data["items"][1]["transaction_type"] == "BUY"
+
+        # 4. Query Holdings
+        holdings_res = await client.get(
+            "/api/v1/trades/holdings",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+        assert holdings_res.status_code == 200
+        assert Decimal(holdings_res.json()[str(setup["asset_id"])]) == Decimal("6.00000000")
+
+        # 5. Query Specific Transaction Details
+        tx_res = await client.get(
+            f"/api/v1/trades/{buy_tx_id}",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+        assert tx_res.status_code == 200
+        assert tx_res.json()["id"] == str(buy_tx_id)
+        assert tx_res.json()["transaction_type"] == "BUY"
+
+
+@pytest.mark.asyncio
+async def test_get_trade_history_unauthenticated_returns_401():
+    """Verify GET /api/v1/trades/history rejects unauthenticated requests with 401."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/api/v1/trades/history")
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_get_trade_history_invalid_token_returns_401():
+    """Verify GET /api/v1/trades/history rejects invalid token with 401."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/v1/trades/history",
+            headers={"Authorization": "Bearer invalid-token"},
+        )
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_get_holdings_unauthenticated_returns_401():
+    """Verify GET /api/v1/trades/holdings rejects unauthenticated requests with 401."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/api/v1/trades/holdings")
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_get_holdings_invalid_token_returns_401():
+    """Verify GET /api/v1/trades/holdings rejects invalid token with 401."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/v1/trades/holdings",
+            headers={"Authorization": "Bearer invalid-token"},
+        )
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_get_trade_by_id_unauthenticated_returns_401():
+    """Verify GET /api/v1/trades/{id} rejects unauthenticated requests with 401."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(f"/api/v1/trades/{uuid4()}")
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_get_trade_by_id_invalid_token_returns_401():
+    """Verify GET /api/v1/trades/{id} rejects invalid token with 401."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            f"/api/v1/trades/{uuid4()}",
+            headers={"Authorization": "Bearer invalid-token"},
+        )
+    assert response.status_code == 401
