@@ -1,4 +1,5 @@
-﻿from decimal import Decimal
+﻿from datetime import datetime, timezone
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -361,4 +362,50 @@ async def test_get_all_net_holdings_aggregates_positive_balances():
         asset2_id: Decimal("5.50000000"),
     }
     session.execute.assert_awaited_once()
+
+
+# ============================================================================
+# Phase 6: Regression & Boundary Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_get_all_net_holdings_empty_returns_empty_dict():
+    """Verify get_all_net_holdings returns empty dict when query returns no rows."""
+    wallet_id = uuid4()
+    session = MagicMock()
+    result = MagicMock()
+    result.tuples.return_value.all.return_value = []
+    session.execute = AsyncMock(return_value=result)
+
+    repository = TradingRepository()
+    holdings = await repository.get_all_net_holdings(wallet_id, session)
+
+    assert holdings == {}
+    session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_transaction_history_with_identical_start_and_end_at():
+    """Verify get_transaction_history builds query with identical start_at and end_at."""
+    wallet_id = uuid4()
+    point_in_time = datetime(2026, 2, 10, 15, 30, 0, tzinfo=timezone.utc)
+    session = MagicMock()
+    result = MagicMock()
+    result.tuples.return_value.all.return_value = []
+    session.execute = AsyncMock(return_value=result)
+
+    repository = TradingRepository()
+    await repository.get_transaction_history(
+        wallet_id=wallet_id,
+        session=session,
+        start_at=point_in_time,
+        end_at=point_in_time,
+    )
+
+    statement = session.execute.await_args.args[0]
+    assert isinstance(statement, Select)
+    compiled = str(statement.compile(compile_kwargs={"literal_binds": True}))
+    assert "transactions.created_at >=" in compiled
+    assert "transactions.created_at <=" in compiled
 

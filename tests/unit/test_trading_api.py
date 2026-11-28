@@ -1185,3 +1185,98 @@ async def test_get_trade_by_id_invalid_token_returns_401():
             headers={"Authorization": "Bearer invalid-token"},
         )
     assert response.status_code == 401
+
+
+# ============================================================================
+# Phase 6: Regression & Boundary Validation Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query_string,expected_error_field",
+    [
+        ("limit=0", "limit"),
+        ("limit=101", "limit"),
+        ("offset=-1", "offset"),
+        ("asset_id=invalid-uuid", "asset_id"),
+        ("transaction_type=INVALID_TRADE_TYPE", "transaction_type"),
+    ],
+)
+async def test_get_trade_history_query_param_validation_rejects_out_of_bounds(
+    api_setup,
+    query_string,
+    expected_error_field,
+):
+    """Verify GET /api/v1/trades/history enforces Pydantic parameter boundaries with 422."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            f"/api/v1/trades/history?{query_string}",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    assert any(expected_error_field in str(err["loc"]) for err in errors)
+
+
+@pytest.mark.asyncio
+async def test_get_trade_by_id_invalid_uuid_returns_422(api_setup):
+    """Verify GET /api/v1/trades/{transaction_id} rejects invalid non-UUID path params with 422."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/v1/trades/not-a-valid-uuid",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_get_trade_history_empty_results(api_setup):
+    """Verify GET /api/v1/trades/history returns 200 with empty list when no trades match."""
+    setup = api_setup
+    setup["mock_service"].get_transaction_history.return_value = TradeHistoryResponse(
+        total=0,
+        limit=50,
+        offset=0,
+        items=[],
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/v1/trades/history",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 0
+    assert data["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_trade_by_id_cross_tenant_access_returns_404(api_setup):
+    """Verify requesting another user's transaction ID securely returns 404 Not Found."""
+    setup = api_setup
+    foreign_tx_id = uuid4()
+    setup["mock_service"].get_transaction_by_id.side_effect = TransactionNotFoundError(foreign_tx_id)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            f"/api/v1/trades/{foreign_tx_id}",
+            headers={"Authorization": "Bearer valid-test-token"},
+        )
+
+    assert response.status_code == 404
+    assert str(foreign_tx_id) in response.json()["detail"]

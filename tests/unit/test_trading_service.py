@@ -2362,3 +2362,91 @@ async def test_trading_service_complete_lifecycle(trading_setup):
     assert item.id == buy_tx.id
     assert item.transaction_type == TradeType.BUY
     assert item.symbol == "BTC"
+
+
+# ============================================================================
+# Phase 6: Regression & Boundary Coverage
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_get_transaction_history_offset_exceeds_total(trading_setup):
+    """Verify requesting an offset beyond total returns empty items list with accurate total."""
+    setup = trading_setup
+    setup["wallet_repo"].get_wallet_by_user_id = AsyncMock(return_value=setup["wallet"])
+    setup["trading_repo"].get_transaction_history = AsyncMock(return_value=[])
+    setup["trading_repo"].count_transaction_history = AsyncMock(return_value=5)
+
+    result = await setup["service"].get_transaction_history(
+        user_id=setup["user_id"],
+        session=setup["session"],
+        limit=10,
+        offset=100,
+    )
+
+    assert result.total == 5
+    assert result.limit == 10
+    assert result.offset == 100
+    assert result.items == []
+
+
+@pytest.mark.asyncio
+async def test_get_transaction_history_exact_timestamp_boundary(trading_setup):
+    """Verify start_at == end_at is accepted for exact point-in-time filtering."""
+    setup = trading_setup
+    exact_time = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    setup["wallet_repo"].get_wallet_by_user_id = AsyncMock(return_value=setup["wallet"])
+    setup["trading_repo"].get_transaction_history = AsyncMock(return_value=[])
+    setup["trading_repo"].count_transaction_history = AsyncMock(return_value=0)
+
+    result = await setup["service"].get_transaction_history(
+        user_id=setup["user_id"],
+        session=setup["session"],
+        start_at=exact_time,
+        end_at=exact_time,
+    )
+
+    assert result.total == 0
+    assert result.items == []
+    setup["trading_repo"].get_transaction_history.assert_awaited_once_with(
+        wallet_id=setup["wallet"].id,
+        session=setup["session"],
+        asset_id=None,
+        transaction_type=None,
+        start_at=exact_time,
+        end_at=exact_time,
+        limit=50,
+        offset=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_user_holdings_empty_returns_empty_dict(trading_setup):
+    """Verify get_user_holdings returns empty dictionary when user has no active holdings."""
+    setup = trading_setup
+    setup["wallet_repo"].get_wallet_by_user_id = AsyncMock(return_value=setup["wallet"])
+    setup["trading_repo"].get_all_net_holdings = AsyncMock(return_value={})
+
+    result = await setup["service"].get_user_holdings(
+        user_id=setup["user_id"],
+        session=setup["session"],
+    )
+
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_get_transaction_by_id_cross_wallet_raises_not_found(trading_setup):
+    """Verify get_transaction_by_id raises TransactionNotFoundError if row is not in user's wallet."""
+    setup = trading_setup
+    foreign_tx_id = uuid4()
+    setup["wallet_repo"].get_wallet_by_user_id = AsyncMock(return_value=setup["wallet"])
+    setup["trading_repo"].get_transaction_by_id = AsyncMock(return_value=None)
+
+    with pytest.raises(TransactionNotFoundError) as exc_info:
+        await setup["service"].get_transaction_by_id(
+            transaction_id=foreign_tx_id,
+            user_id=setup["user_id"],
+            session=setup["session"],
+        )
+    assert exc_info.value.transaction_id == foreign_tx_id
